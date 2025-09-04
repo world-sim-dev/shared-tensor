@@ -255,3 +255,4 @@ def test_model_serialization(model: torch.nn.Module, **kwargs) -> Dict[str, Any]
     """
     return serialization_test_helper.test_model_serialization(model, **kwargs)
 
+

@@ -49,6 +49,12 @@ Shared Tensor is a cross-process communication library designed specifically for
 
 ### Installation Methods
 
+#### Install from Pypi
+
+```bash
+pip install shared-tensor
+```
+
 #### Install from Source
 
 ```bash
@@ -234,7 +240,6 @@ shared-tensor/
 │   ├── jsonrpc.py            # JSON-RPC protocol implementation
 │   ├── utils.py              # Utility functions
 │   └── errors.py             # Exception definitions
-├── scripts/                   # Script tools
 ├── examples/                  # Usage examples
 └── tests/                     # Test suite
 ```
@@ -314,6 +319,11 @@ pip install -e ".[dev]"
 
 # Install pre-commit hooks
 pre-commit install
+
+# Package & Publish
+python setup.py sdist bdist_wheel
+python -m twine upload --repository testpypi dist/*
+python -m twine upload dist/*
 ```
 
 ### Code Standards
