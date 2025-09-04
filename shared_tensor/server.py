@@ -15,6 +15,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import json
 
+import torch
+
 from shared_tensor.jsonrpc import (
     JsonRpcErrorCodes,
     parse_request,
@@ -417,6 +419,10 @@ def main():
     import argparse
     
     rank = int(os.getenv("RANK", 0))
+    local_rank = int(os.getenv("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    logger.info(f"Using device {local_rank}")
+
     parser = argparse.ArgumentParser(description='Shared Tensor JSON-RPC Server')
     parser.add_argument('--host', default='localhost', help='Server host (default: localhost)')
     parser.add_argument('--port', type=int, default=2537 + rank, help='Server port (default: {})'.format(2537 + rank))
