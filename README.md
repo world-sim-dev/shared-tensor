@@ -78,12 +78,6 @@ pip install -e ".[test]"
 ```bash
 # Check core functionality
 python -c "import shared_tensor; print('✓ Shared Tensor installed successfully')"
-
-# Check PyTorch integration
-python -c "import torch; import shared_tensor; print('✓ PyTorch integration working')"
-
-# Check CUDA support (if you have GPU)
-python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 ```
 
 ## 🎯 Quick Start
@@ -91,83 +85,42 @@ python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 ### 1. Basic Function Sharing
 
 ```python
-from shared_tensor.provider import SharedTensorProvider
+from shared_tensor.async_provider import AsyncSharedTensorProvider
 
 # Create provider
-provider = SharedTensorProvider()
+provider = AsyncSharedTensorProvider()
 
 # Share simple function
-@provider.share(name="add_numbers")
+@provider.share()
 def add_numbers(a, b):
     return a + b
 
 # Share PyTorch function
-@provider.share(name="create_tensor")
-def create_tensor(shape, device="cpu"):
+@provider.share()
+def create_tensor(shape):
     import torch
-    return torch.zeros(shape, device=device)
+    return torch.zeros(shape)
+
+# Load PyTorch model
+@provider.share()
+def load_model():
+    ...
+
 ```
 
 ### 2. Start Server
 
 ```bash
-# Method 1: Use command line tool
+# Method 1: Use command line tool, single server
 shared-tensor-server
 
-# Method 2: Use script
-python scripts/start_server.sh
+# Method 2: Use torchrun
+torchrun --nproc_per_node=4 --no-python shared-tensor-server
 
 # Method 3: Custom configuration
-python -m shared_tensor.server --host 0.0.0.0 --port 9000
+python shared_tensor/server.py
 ```
 
-### 3. Client Usage
-
-```python
-from shared_tensor.client import SharedTensorClient
-
-# Connect to server
-client = SharedTensorClient(server_port=2537)
-
-# Remote function call
-result = client.call_function("add_numbers", [10, 20])
-print(f"Result: {result}")  # Output: Result: 30
-
-# Create remote tensor
-tensor = client.call_function("create_tensor", [(3, 4)], {"device": "cuda:0"})
-print(f"Tensor shape: {tensor.shape}")
-```
-
-### 4. Async Execution
-
-```python
-from shared_tensor.async_provider import AsyncSharedTensorProvider
-from shared_tensor.async_client import AsyncSharedTensorClient
-
-# Async provider
-async_provider = AsyncSharedTensorProvider()
-
-@async_provider.share(name="async_computation")
-def heavy_computation(data):
-    # Simulate heavy computation
-    import time
-    time.sleep(2)
-    return data * 2
-
-# Async client
-async_client = AsyncSharedTensorClient()
-
-# Submit async task
-task_id = async_client.submit_task("async_computation", [100])
-
-# Check task status
-status = async_client.get_task_status(task_id)
-print(f"Task status: {status}")
-
-# Get result
-result = async_client.get_task_result(task_id)
-print(f"Async result: {result}")
-```
 
 ## 📖 Detailed Usage
 
@@ -176,9 +129,11 @@ print(f"Async result: {result}")
 ```python
 import torch
 import torch.nn as nn
-from shared_tensor.provider import SharedTensorProvider
 
-provider = SharedTensorProvider()
+from shared_tensor.async_provider import AsyncSharedTensorProvider
+
+# Create provider
+provider = AsyncSharedTensorProvider()
 
 # Define model
 class SimpleNet(nn.Module):
@@ -201,32 +156,9 @@ def create_model(input_size=784, hidden_size=128, output_size=10):
     return model
 
 # Share inference function
-@provider.share(name="model_inference")
-def model_inference(model, input_data):
-    with torch.no_grad():
-        return model(input_data)
-```
-
-### Distributed Inference
-
-```python
-import os
-from shared_tensor.provider import SharedTensorProvider
-
-# Support multi-GPU environment
-gpu_rank = int(os.getenv("RANK", 0))
-provider = SharedTensorProvider(server_port=2537 + gpu_rank)
-
-@provider.share(name="distributed_inference")
-def distributed_inference(model, data, device_id):
-    device = f"cuda:{device_id}"
-    model = model.to(device)
-    data = data.to(device)
-    
-    with torch.no_grad():
-        result = model(data)
-    
-    return result.cpu()
+model = create_model()
+with torch.no_grad():
+    model(input_data)
 ```
 
 ## 🔧 Configuration Options
@@ -244,35 +176,6 @@ server = SharedTensorServer(
     enable_cache=True,        # Enable result caching
     debug=False               # Debug mode
 )
-```
-
-### Client Configuration
-
-```python
-from shared_tensor.client import SharedTensorClient
-
-client = SharedTensorClient(
-    server_port=2537,         # Server port
-    timeout=30,               # Request timeout
-    retry_count=3,            # Retry count
-    verbose_debug=False       # Verbose debug info
-)
-```
-
-### Environment Variables
-
-```bash
-# Set GPU count
-export GPUS_PER_NODE=4
-
-# Set process rank
-export RANK=0
-
-# Enable server mode
-export __SHARED_TENSOR_SERVER_MODE__=true
-
-# Set Python path
-export PYTHONPATH=.:$PYTHONPATH
 ```
 
 ## 🧪 Testing
@@ -313,32 +216,6 @@ python tests/integration/test_async_system.py
 
 # Test client
 python tests/integration/test_client.py
-```
-
-## 📚 Examples
-
-Check the `examples/` directory for complete examples:
-
-- **`simple_test.py`**: Basic functionality demonstration
-- **`example_usage.py`**: Typical use cases
-- **`demo_async_vs_sync.py`**: Async vs sync comparison
-- **`example_models.py`**: PyTorch model examples
-- **`remote_execution_demo.py`**: Remote execution demo
-
-Run examples:
-
-```bash
-# Standalone examples
-python examples/simple_test.py
-python examples/example_models.py
-
-# Examples requiring server
-# Terminal 1: Start server
-python scripts/start_server.sh
-
-# Terminal 2: Run examples
-python examples/example_usage.py
-python examples/demo_async_vs_sync.py
 ```
 
 ## 🏗️ Architecture Design
@@ -398,45 +275,6 @@ sequenceDiagram
     Note over CA, FE: End-to-End Process Complete
 ```
 
-## 🔍 Troubleshooting
-
-### Common Issues
-
-#### 1. Connection Refused
-```
-ConnectionRefusedError: [Errno 111] Connection refused
-```
-**Solution**: Ensure server is started
-```bash
-python scripts/start_server.sh
-```
-
-#### 2. Module Import Error
-```
-ModuleNotFoundError: No module named 'shared_tensor'
-```
-**Solution**: Check installation and Python path
-```bash
-pip install -e .
-export PYTHONPATH=.:$PYTHONPATH
-```
-
-#### 3. CUDA Unavailable
-```
-RuntimeError: CUDA is not available
-```
-**Solution**: Use CPU device or install CUDA
-```python
-# Use CPU
-tensor = create_tensor((3, 4), device="cpu")
-```
-
-#### 4. Serialization Error
-```
-PickleError: Can't pickle function
-```
-**Solution**: Ensure functions are picklable, avoid local functions
-
 ### Debug Tips
 
 1. **Enable verbose logging**:
@@ -447,7 +285,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 2. **Use debug mode**:
 ```python
-client = SharedTensorClient(verbose_debug=True)
+provider = SharedTensorProvider(verbose_debug=True)
 ```
 
 3. **Check function paths**:
@@ -513,13 +351,12 @@ This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENS
 
 - [PyTorch](https://pytorch.org/) - Deep learning framework
 - [JSON-RPC 2.0](https://www.jsonrpc.org/) - Remote procedure call protocol
-- Athena Team - Project development and maintenance
 
 ## 📞 Contact Us
 
-- **Issues**: [GitHub Issues](https://github.com/your-org/athena/issues)
-- **Documentation**: [Athena Documentation](https://athena.readthedocs.io/)
-- **Source**: [GitHub Repository](https://github.com/your-org/athena)
+- **Issues**: [GitHub Issues](https://github.com/world-sim-dev/shared-tensor/issues)
+- **Documentation**: [Shared Tensor Documentation](https://github.com/world-sim-dev/shared-tensor/wiki)
+- **Source**: [GitHub Repository](https://github.com/world-sim-dev/shared-tensor)
 
 ---
 
