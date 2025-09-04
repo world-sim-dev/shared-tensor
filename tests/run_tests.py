@@ -149,7 +149,7 @@ def check_dependencies():
     try:
         from shared_tensor.async_provider import async_provider
         
-        @async_provider.share_async(name="test_server_check", wait=True)
+        @async_provider.share(name="test_server_check", wait=True)
         def test_server():
             return "server_available"
         

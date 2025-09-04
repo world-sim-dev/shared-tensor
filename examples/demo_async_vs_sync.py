@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from shared_tensor.async_provider import async_provider
 
 # 定义一个需要长时间运行的函数
-@async_provider.share_async(name="long_running_task", wait=False)
+@async_provider.share(name="long_running_task", wait=False)
 def long_running_task(duration: int, task_name: str):
     """模拟长时间运行的任务"""
     import time

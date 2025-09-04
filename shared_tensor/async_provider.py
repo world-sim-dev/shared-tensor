@@ -42,7 +42,7 @@ class AsyncSharedTensorProvider(SharedTensorProvider):
             logger.debug(f"Async client created with server port {self.server_port} and poll interval {self.poll_interval}")
         return self._async_client
     
-    def share_async(self, name: Optional[str] = None, wait: bool = True, singleton: bool = True, singleton_key_formatter: Optional[str] = None):
+    def share(self, name: Optional[str] = None, wait: bool = True, singleton: bool = True, singleton_key_formatter: Optional[str] = None):
         """
         Decorator to register a function for async remote sharing
         
