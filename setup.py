@@ -83,9 +83,11 @@ setup(
         "inference",
         "distributed-computing",
     ],
+    author="Athena Team",
+    author_email="contact@world-sim-dev.org",
     project_urls={
-        "Bug Reports": "https://github.com/your-org/athena/issues",
-        "Source": "https://github.com/your-org/athena",
-        "Documentation": "https://athena.readthedocs.io/",
+        "Bug Reports": "https://github.com/world-sim-dev/shared-tensor/issues",
+        "Source": "https://github.com/world-sim-dev/shared-tensor",
+        "Documentation": "https://github.com/world-sim-dev/shared-tensor/wiki",
     },
 )

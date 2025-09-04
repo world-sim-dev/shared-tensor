@@ -1,0 +1,30 @@
+# Include the README and LICENSE files
+include README.md
+include LICENSE
+
+# Include all files in the shared_tensor package
+recursive-include shared_tensor *.py
+recursive-include shared_tensor *.so *.dll *.dylib
+
+# Include scripts
+include scripts/start_server.sh
+
+# Exclude test files and examples from the distribution
+exclude tests/*
+exclude examples/*
+recursive-exclude tests *
+recursive-exclude examples *
+
+# Exclude development files
+exclude .gitignore
+exclude .git/*
+exclude __pycache__/*
+recursive-exclude * __pycache__
+recursive-exclude * *.pyc
+recursive-exclude * *.pyo
+recursive-exclude * .DS_Store
+
+# Exclude build artifacts
+exclude build/*
+exclude dist/*
+exclude *.egg-info/*
