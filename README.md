@@ -167,21 +167,26 @@ with torch.no_grad():
     model(input_data)
 ```
 
+
 ## 🔧 Configuration Options
 
 ### Server Configuration
 
 ```python
-from shared_tensor.server import SharedTensorServer
-
-server = SharedTensorServer(
-    host="0.0.0.0",           # Listen address
-    port=2537,                # Port number
-    timeout=30,               # Request timeout
-    max_workers=4,            # Maximum worker threads
-    enable_cache=True,        # Enable result caching
-    debug=False               # Debug mode
+provider = AsyncSharedTensorProvider(
+    server_port: int = 2537 + global_rank,    # Local Http Server Port
+    verbose_debug: bool = False,              # Logging more detailed params
+    poll_interval: float = 1.0,               # Check status interval only for Async provider
+    default_enabled: bool = True              # Whether enable shared-tenser and re-enable via env `export __SHARED_TENSOR_ENABLED__=true`
 )
+
+@provider.share(
+    name: Optional[str] = None,               # name for logging and debug, when singleton enabled, as default cache key
+    wait: bool = True,                        # whether return func return or a async handler
+    singleton: bool = True,                   # whether maintain only one instance of func result
+    singleton_key_formatter: Optional[str] = None): # python template can be formatted by user function params, act as final cache key
+def get_demo_model():
+    ...
 ```
 
 ## 🧪 Testing
@@ -322,7 +327,7 @@ pre-commit install
 
 # Package & Publish
 python -m pip install build
-python -m build --sdist
+python -m build --sdist --wheel
 python -m twine upload --repository testpypi dist/*
 python -m twine upload dist/*
 ```

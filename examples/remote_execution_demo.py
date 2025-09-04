@@ -35,7 +35,7 @@ from shared_tensor.async_provider import async_provider
 
 
 # Define remote functions for demonstration
-@async_provider.share_async(name="demo_create_tensor", wait=True)
+@async_provider.share(name="demo_create_tensor", wait=True)
 def demo_create_tensor(shape, value=1.0, device="cpu"):
     """Create a tensor remotely"""
     import torch
@@ -44,7 +44,7 @@ def demo_create_tensor(shape, value=1.0, device="cpu"):
     return tensor
 
 
-@async_provider.share_async(name="demo_add_tensors", wait=True)  
+@async_provider.share(name="demo_add_tensors", wait=True)  
 def demo_add_tensors(a, b):
     """Add two tensors remotely"""
     import torch
@@ -53,7 +53,7 @@ def demo_add_tensors(a, b):
     return result
 
 
-@async_provider.share_async(name="demo_matrix_multiply", wait=True)
+@async_provider.share(name="demo_matrix_multiply", wait=True)
 def demo_matrix_multiply(a, b):
     """Multiply two matrices remotely"""
     import torch
@@ -62,7 +62,7 @@ def demo_matrix_multiply(a, b):
     return result
 
 
-@async_provider.share_async(name="demo_gpu_computation", wait=True)
+@async_provider.share(name="demo_gpu_computation", wait=True)
 def demo_gpu_computation(size=1000):
     """Perform GPU computation if available"""
     import torch

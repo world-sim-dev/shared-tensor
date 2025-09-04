@@ -53,7 +53,7 @@ class TestFunctionPathResolution(unittest.TestCase):
     def test_async_provider_main_module_resolution(self):
         """Test async provider resolves __main__ module correctly"""
         
-        @self.async_provider.share_async(name="test_async_function", wait=True)
+        @self.async_provider.share(name="test_async_function", wait=True)
         def test_async_function(x, y):
             """Test function for async provider"""
             return x + y

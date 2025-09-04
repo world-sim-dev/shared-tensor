@@ -18,7 +18,7 @@ async_provider = AsyncSharedTensorProvider()
 
 
 # Define some long-running test functions
-@async_provider.share_async(name="slow_computation", wait=False)
+@async_provider.share(name="slow_computation", wait=False)
 def slow_computation(duration: int, message: str = "Computing"):
     """Simulate a slow computation"""
     import time
@@ -33,7 +33,7 @@ def slow_computation(duration: int, message: str = "Computing"):
     return result
 
 
-@async_provider.share_async(name="cpu_intensive", wait=True)
+@async_provider.share(name="cpu_intensive", wait=True)
 def cpu_intensive_task(iterations: int):
     """CPU intensive task"""
     import math
@@ -47,7 +47,7 @@ def cpu_intensive_task(iterations: int):
     return f"CPU task completed: {result:.2f}"
 
 
-@async_provider.share_async(name="data_processing")
+@async_provider.share(name="data_processing")
 def process_large_dataset(size: int, factor: float = 1.5):
     """Simulate processing a large dataset"""
     import time

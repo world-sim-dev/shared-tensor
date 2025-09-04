@@ -32,7 +32,7 @@ from shared_tensor.async_provider import async_provider
 
 
 # Define remote functions
-@async_provider.share_async(name="demo_create_tensor", wait=True)
+@async_provider.share(name="demo_create_tensor", wait=True)
 def demo_create_tensor(shape, value=1.0, device="cpu"):
     """Remote function that creates a PyTorch tensor"""
     import torch
@@ -41,7 +41,7 @@ def demo_create_tensor(shape, value=1.0, device="cpu"):
     return tensor
 
 
-@async_provider.share_async(name="demo_tensor_add", wait=True)
+@async_provider.share(name="demo_tensor_add", wait=True)
 def demo_tensor_add(tensor1, tensor2):
     """Remote function that adds two tensors"""
     import torch
