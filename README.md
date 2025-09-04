@@ -321,7 +321,8 @@ pip install -e ".[dev]"
 pre-commit install
 
 # Package & Publish
-python setup.py sdist bdist_wheel
+python -m pip install build
+python -m build --sdist
 python -m twine upload --repository testpypi dist/*
 python -m twine upload dist/*
 ```

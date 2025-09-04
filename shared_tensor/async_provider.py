@@ -28,8 +28,8 @@ class AsyncSharedTensorProvider(SharedTensorProvider):
     Supports both sync and async execution modes
     """
     
-    def __init__(self, server_port: int = 2537 + global_rank, verbose_debug: bool = False, poll_interval: float = 1.0):
-        super().__init__(server_port=server_port, verbose_debug=verbose_debug)
+    def __init__(self, server_port: int = 2537 + global_rank, verbose_debug: bool = False, poll_interval: float = 1.0, default_enabled: bool = True):
+        super().__init__(server_port=server_port, verbose_debug=verbose_debug, default_enabled=default_enabled)
         self.poll_interval = poll_interval
         logger.debug(f"AsyncSharedTensorProvider initialized with server port {server_port}, verbose debug {verbose_debug}, and poll interval {poll_interval}")
         self._async_client = None
@@ -57,6 +57,10 @@ class AsyncSharedTensorProvider(SharedTensorProvider):
 
             if self.server_mode == "true":
                 logger.debug(f"Server mode is true, returning function {func_name} without registering")
+                return func
+            
+            if not self._enabled:
+                logger.debug(f"SharedTensor is disabled, returning function {func_name} without registering")
                 return func
 
             logger.debug(f"Server mode is false, registering function {func_name}")

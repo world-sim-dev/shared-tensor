@@ -21,12 +21,13 @@ global_rank = int(os.getenv("RANK", 0))
 
 class SharedTensorProvider:
 
-    def __init__(self, server_port: int = 2537 + global_rank, verbose_debug: bool = False):
+    def __init__(self, server_port: int = 2537 + global_rank, verbose_debug: bool = False, default_enabled: bool = True):
         self.server_port: int = server_port
         self.server_mode = os.getenv("__SHARED_TENSOR_SERVER_MODE__", "false")
         self.verbose_debug = verbose_debug
         logger.debug(f"SharedTensorProvider initialized with server port {self.server_port}, server mode {self.server_mode}, and verbose debug {self.verbose_debug}")
         self._registered_functions: Dict[str, Dict[str, Any]] = {}
+        self._enabled = os.getenv("__SHARED_TENSOR_ENABLED__", "true" if default_enabled else "false") == "true"
         self._client = None
 
     def _get_function_path(self, func: Callable) -> str:
@@ -92,6 +93,10 @@ class SharedTensorProvider:
 
             if self.server_mode == "true":
                 logger.debug(f"Server mode is true, returning function {func_name} without registering")
+                return func
+            
+            if not self._enabled:
+                logger.debug(f"SharedTensor is disabled, returning function {func_name} without registering")
                 return func
 
             logger.debug(f"Server mode is false, registering function {func_name}")
