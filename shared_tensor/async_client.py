@@ -1,302 +1,166 @@
-"""
-Async Shared Tensor Client
+"""Async task-oriented client facade built on top of :mod:`shared_tensor.client`."""
 
-Supports long-running task execution without HTTP timeout limitations.
-"""
+from __future__ import annotations
 
 import time
-import logging
-from typing import Any, Dict, Optional, Callable
+from collections.abc import Callable
+from typing import Any, cast
 
-import torch
-
-from shared_tensor.errors import SharedTensorServerError
+from shared_tensor.async_task import TaskInfo, TaskStatus
 from shared_tensor.client import SharedTensorClient
-from shared_tensor.async_task import TaskStatus, TaskInfo
-from shared_tensor.utils import serialize_result
-
-
-__all__ = ["AsyncSharedTensorClient", "execute_remote_function_async"]
-
-
-logger = logging.getLogger(__name__)
+from shared_tensor.errors import SharedTensorTaskError
+from shared_tensor.utils import resolve_legacy_endpoint_name, serialize_call_payloads
 
 
 class AsyncSharedTensorClient:
-    """
-    Async client for shared tensor operations
-    
-    Supports submitting long-running tasks and polling for results
-    without being limited by HTTP timeouts.
-    """
-    
-    def __init__(self, server_port: int = 2537, verbose_debug: bool = False, poll_interval: float = 1.0):
-        """
-        Initialize async client
-        
-        Args:
-            server_port: Port of the shared tensor server
-            verbose_debug: Whether to enable verbose debug logging
-            poll_interval: Interval in seconds for polling task status
-        """
-        self.server_url = f"http://localhost:{server_port}"
-        self.verbose_debug = verbose_debug
+    def __init__(
+        self,
+        port: int = 2537,
+        verbose_debug: bool = False,
+        poll_interval: float = 1.0,
+        *,
+        host: str = "127.0.0.1",
+        timeout: float = 30.0,
+    ) -> None:
         self.poll_interval = poll_interval
-        self._client = SharedTensorClient(server_port, verbose_debug=verbose_debug)
-    
-    def submit_task(self, function_path: str, args: tuple = (), kwargs: Dict[str, Any] = None, options: Dict[str, Any] = None) -> str:
-        """
-        Submit a task for async execution
-        
-        Args:
-            function_path: Function path in format "module.submodule:function_name"
-            args: Positional arguments
-            kwargs: Keyword arguments
-            options: Options for the task
-            
-        Returns:
-            Task ID for tracking the execution
-        """
-        if kwargs is None:
-            kwargs = {}
-        
-        args_hex = serialize_result(args).hex() if args else ""
-        kwargs_hex = serialize_result(kwargs).hex() if kwargs else ""
-        
-        if self.verbose_debug:
-            logger.debug(f"Submitting task with function path {function_path}, args {args}, kwargs {kwargs}, and options {options}")
-        else:
-            logger.debug(f"Submitting task with function path {function_path}")
-        
-        response = self._client._send_request(
-            self._client._create_request("submit_task", {
-                "function_path": function_path,
-                "args": args_hex,
-                "kwargs": kwargs_hex,
-                "options": options,
-                "encoding": "pickle_hex",
-            })
+        self._client = SharedTensorClient(
+            port=port,
+            host=host,
+            timeout=timeout,
+            verbose_debug=verbose_debug,
         )
-        
-        if response.error:
-            raise SharedTensorServerError(f"Failed to submit task: {response.error}")
-        
-        task_id = response.result.get("task_id")
-        if not task_id:
-            raise SharedTensorServerError("Server did not return task ID")
-        
-        logger.debug(f"Task submitted: {task_id}")
-        return task_id
-    
+
+    def submit(self, endpoint: str, *args: Any, **kwargs: Any) -> str:
+        encoding, args_payload, kwargs_payload = serialize_call_payloads(tuple(args), dict(kwargs))
+        result = self._client._request(
+            "submit",
+            {
+                "endpoint": endpoint,
+                "args_hex": args_payload.hex(),
+                "kwargs_hex": kwargs_payload.hex(),
+                "encoding": encoding,
+            },
+        )
+        return cast(str, result["task_id"])
+
+    def submit_task(
+        self,
+        function_path: str,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> str:
+        del options
+        endpoint = resolve_legacy_endpoint_name(function_path)
+        return self.submit(endpoint, *(args or ()), **(kwargs or {}))
+
+    def status(self, task_id: str) -> TaskInfo:
+        return TaskInfo.from_dict(self._client._request("get_task", {"task_id": task_id}))
+
     def get_task_status(self, task_id: str) -> TaskInfo:
-        """
-        Get current status of a task
-        
-        Args:
-            task_id: Task ID returned by submit_task
-            
-        Returns:
-            TaskInfo object with current status
-        """
-        logger.debug(f"Getting task status for task {task_id}")
-        response = self._client._send_request(
-            self._client._create_request("get_task_status", {"task_id": task_id})
-        )
-        
-        if response.error:
-            logger.debug(f"Failed to get task status: {response.error}")
-            raise SharedTensorServerError(f"Failed to get task status: {response.error}")
-        
-        task_data = response.result
-        if not task_data:
-            raise SharedTensorServerError(f"Task {task_id} not found")
-        
-        return TaskInfo.from_dict(task_data)
-    
+        return self.status(task_id)
+
+    def result(self, task_id: str) -> Any:
+        result = self._client._request("get_task_result", {"task_id": task_id})
+        return SharedTensorClient._decode_rpc_payload(result)
+
     def get_task_result(self, task_id: str) -> Any:
-        """
-        Get result of a completed task
-        
-        Args:
-            task_id: Task ID
-            
-        Returns:
-            Task result (deserialized)
-            
-        Raises:
-            RuntimeError: If task failed or not completed
-        """
-        task_info = self.get_task_status(task_id)
-        
-        if task_info.status == TaskStatus.FAILED:
-            raise SharedTensorServerError(f"Task failed: {task_info.error_message}")
-        
-        if task_info.status != TaskStatus.COMPLETED:
-            raise SharedTensorServerError(f"Task not completed, current status: {task_info.status.value}")
-        
-        if task_info.result_hex:
-            result_bytes = bytes.fromhex(task_info.result_hex)
-            return torch.multiprocessing.reducer.ForkingPickler.loads(result_bytes)
-        return None
-    
-    def wait_for_task(self, task_id: str, timeout: Optional[float] = None, 
-                     callback: Optional[Callable[[TaskInfo], None]] = None) -> Any:
-        """
-        Wait for a task to complete and return its result
-        
-        Args:
-            task_id: Task ID
-            timeout: Maximum time to wait (None for no timeout)
-            callback: Optional callback function called on each status update
-            
-        Returns:
-            Task result
-        """
-        start_time = time.time()
-        
+        return self.result(task_id)
+
+    def wait(
+        self,
+        task_id: str,
+        timeout: float | None = None,
+        callback: Callable[[TaskInfo], None] | None = None,
+    ) -> Any:
+        started = time.time()
         while True:
-            task_info = self.get_task_status(task_id)
-            
-            # Call callback if provided
-            if callback:
-                try:
-                    callback(task_info)
-                except Exception as e:
-                    logger.warning(f"Callback error: {e}")
-            
-            # Check if completed
-            if task_info.status == TaskStatus.COMPLETED:
-                return self.get_task_result(task_id)
-            
-            # Check if failed
-            if task_info.status == TaskStatus.FAILED:
-                raise SharedTensorServerError(f"Task {task_id} failed: {task_info.error_message}")
-            
-            # Check if cancelled
-            if task_info.status == TaskStatus.CANCELLED:
-                raise SharedTensorServerError("Task was cancelled")
-            
-            # Check timeout
-            if timeout and (time.time() - start_time) > timeout:
-                raise SharedTensorServerError(f"Task {task_id} did not complete within {timeout} seconds")
-            
-            # Sleep before next poll
+            info = self.status(task_id)
+            if callback is not None:
+                callback(info)
+            if info.status == TaskStatus.COMPLETED:
+                return self.result(task_id)
+            if info.status == TaskStatus.FAILED:
+                raise SharedTensorTaskError(info.error_message or f"Task '{task_id}' failed")
+            if info.status == TaskStatus.CANCELLED:
+                raise SharedTensorTaskError(f"Task '{task_id}' was cancelled")
+            if timeout is not None and time.time() - started > timeout:
+                raise SharedTensorTaskError(
+                    f"Task '{task_id}' did not complete within {timeout} seconds"
+                )
             time.sleep(self.poll_interval)
-    
-    def execute_function_async(self, function_path: str, args: tuple = (), 
-                              kwargs: Dict[str, Any] = None, options: Dict[str, Any] = None, wait: bool = True,
-                              timeout: Optional[float] = None,
-                              callback: Optional[Callable[[TaskInfo], None]] = None) -> Any:
-        """
-        Execute a function asynchronously
-        
-        Args:
-            function_path: Function path
-            args: Positional arguments
-            kwargs: Keyword arguments
-            options: Options for the task
-            wait: Whether to wait for completion
-            timeout: Maximum time to wait if wait=True
-            callback: Status update callback
-            
-        Returns:
-            If wait=True: Function result
-            If wait=False: Task ID
-        """
-        task_id = self.submit_task(function_path, args, kwargs, options)
-        
-        if wait:
-            return self.wait_for_task(task_id, timeout, callback)
-        else:
+
+    def wait_for_task(
+        self,
+        task_id: str,
+        timeout: float | None = None,
+        callback: Callable[[TaskInfo], None] | None = None,
+    ) -> Any:
+        return self.wait(task_id, timeout=timeout, callback=callback)
+
+    def execute_function_async(
+        self,
+        function_path: str,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+        wait: bool = True,
+        timeout: float | None = None,
+        callback: Callable[[TaskInfo], None] | None = None,
+    ) -> Any:
+        del options
+        task_id = self.submit_task(function_path, args=args, kwargs=kwargs)
+        if not wait:
             return task_id
-    
+        return self.wait(task_id, timeout=timeout, callback=callback)
+
+    def cancel(self, task_id: str) -> bool:
+        return bool(self._client._request("cancel_task", {"task_id": task_id})["cancelled"])
+
     def cancel_task(self, task_id: str) -> bool:
-        """
-        Cancel a task
-        
-        Args:
-            task_id: Task ID
-            
-        Returns:
-            True if successfully cancelled
-        """
-        response = self._client._send_request(
-            self._client._create_request("cancel_task", {"task_id": task_id})
-        )
-        
-        if response.error:
-            logger.error(f"Failed to cancel task: {response.error}")
-            return False
-        
-        return response.result.get("cancelled", False)
-    
-    def list_tasks(self, status: Optional[str] = None) -> Dict[str, TaskInfo]:
-        """
-        List tasks on the server
-        
-        Args:
-            status: Optional status filter
-            
-        Returns:
-            Dictionary of task ID -> TaskInfo
-        """
-        params = {}
-        if status:
-            params["status"] = status
-        
-        response = self._client._send_request(
-            self._client._create_request("list_tasks", params)
-        )
-        
-        if response.error:
-            raise SharedTensorServerError(f"Failed to list tasks: {response.error}")
-        
-        tasks = {}
-        for task_id, task_data in response.result.items():
-            tasks[task_id] = TaskInfo.from_dict(task_data)
-        
-        return tasks
-    
-    def close(self):
-        """Close the client"""
+        return self.cancel(task_id)
+
+    def list_tasks(self, status: str | None = None) -> dict[str, TaskInfo]:
+        params = {"status": status} if status else None
+        result = self._client._request("list_tasks", params)
+        return {task_id: TaskInfo.from_dict(data) for task_id, data in result.items()}
+
+    def close(self) -> None:
         self._client.close()
-    
-    def __enter__(self):
+
+    def __enter__(self) -> AsyncSharedTensorClient:
         return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
         self.close()
 
 
 def execute_remote_function_async(
     function_path: str,
-    args: tuple = (),
-    kwargs: Dict[str, Any] = None,
-    options: Dict[str, Any] = None,
+    args: tuple[Any, ...] = (),
+    kwargs: dict[str, Any] | None = None,
+    options: dict[str, Any] | None = None,
+    *,
     server_port: int = 2537,
+    host: str = "127.0.0.1",
     verbose_debug: bool = False,
     poll_interval: float = 1.0,
     wait: bool = True,
-    timeout: Optional[float] = None,
-    callback: Optional[Callable[[TaskInfo], None]] = None
+    timeout: float | None = None,
+    callback: Callable[[TaskInfo], None] | None = None,
 ) -> Any:
-    """
-    Convenience function to execute a remote function asynchronously
-    
-    Args:
-        function_path: Function path
-        args: Positional arguments
-        kwargs: Keyword arguments
-        options: Options for the task
-        server_port: Port of the shared tensor server
-        verbose_debug: Whether to enable verbose debug logging
-        poll_interval: Interval in seconds for polling task status
-        wait: Whether to wait for completion
-        timeout: Maximum time to wait
-        callback: Status update callback
-        
-    Returns:
-        Function result if wait=True, task ID if wait=False
-    """
-    with AsyncSharedTensorClient(server_port, verbose_debug, poll_interval) as client:
-        return client.execute_function_async(function_path, args, kwargs, options, wait, timeout, callback)
+    with AsyncSharedTensorClient(
+        port=server_port,
+        host=host,
+        verbose_debug=verbose_debug,
+        poll_interval=poll_interval,
+    ) as client:
+        return client.execute_function_async(
+            function_path,
+            args=args,
+            kwargs=kwargs,
+            options=options,
+            wait=wait,
+            timeout=timeout,
+            callback=callback,
+        )

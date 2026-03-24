@@ -1,163 +1,116 @@
-"""
-JSON-RPC 2.0 implementation for shared tensor communication
+"""Minimal JSON-RPC 2.0 helpers used by the local HTTP transport."""
 
-Implements JSON-RPC 2.0 specification: https://www.jsonrpc.org/specification
-"""
+from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Dict, Optional, Union
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
+from typing import Any
+
+from shared_tensor.errors import SharedTensorProtocolError
 
 
-@dataclass
+@dataclass(slots=True)
 class JsonRpcRequest:
-    """JSON-RPC 2.0 Request object"""
     method: str
-    params: Optional[Union[Dict[str, Any], list]] = None
-    id: Optional[Union[str, int]] = None
+    params: dict[str, Any] | None = None
+    id: str | int | None = None
     jsonrpc: str = "2.0"
-    
-    def __post_init__(self):
+
+    def __post_init__(self) -> None:
         if self.id is None:
             self.id = str(uuid.uuid4())
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization"""
-        result = asdict(self)
-        # Remove None params to keep the request clean
-        if result['params'] is None:
-            del result['params']
-        return result
-    
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        if payload["params"] is None:
+            payload.pop("params")
+        return payload
+
     def to_json(self) -> str:
-        """Convert to JSON string"""
         return json.dumps(self.to_dict())
 
 
-@dataclass
+@dataclass(slots=True)
 class JsonRpcResponse:
-    """JSON-RPC 2.0 Response object"""
-    id: Optional[Union[str, int]]
-    result: Optional[Any] = None
-    error: Optional[Dict[str, Any]] = None
+    id: str | int | None
+    result: Any | None = None
+    error: dict[str, Any] | None = None
     jsonrpc: str = "2.0"
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization"""
-        result = asdict(self)
-        # Only include result OR error, not both
-        if self.error is not None:
-            result.pop('result', None)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        if self.error is None:
+            payload.pop("error")
         else:
-            result.pop('error', None)
-        return result
-    
+            payload.pop("result")
+        return payload
+
     def to_json(self) -> str:
-        """Convert to JSON string"""
         return json.dumps(self.to_dict())
 
 
-@dataclass
-class JsonRpcError:
-    """JSON-RPC 2.0 Error object"""
-    code: int
-    message: str
-    data: Optional[Any] = None
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary"""
-        result = asdict(self)
-        if result['data'] is None:
-            del result['data']
-        return result
-
-
-# Standard JSON-RPC error codes
 class JsonRpcErrorCodes:
     PARSE_ERROR = -32700
     INVALID_REQUEST = -32600
     METHOD_NOT_FOUND = -32601
     INVALID_PARAMS = -32602
     INTERNAL_ERROR = -32603
-    
-    # Custom error codes for shared tensor
-    FUNCTION_IMPORT_ERROR = -32001
-    FUNCTION_EXECUTION_ERROR = -32002
-    SERIALIZATION_ERROR = -32003
+    ENDPOINT_NOT_FOUND = -32001
+    SERIALIZATION_ERROR = -32002
+    CAPABILITY_ERROR = -32003
+    TASK_ERROR = -32004
+    REMOTE_ERROR = -32005
 
 
-def create_success_response(request_id: Optional[Union[str, int]], result: Any) -> JsonRpcResponse:
-    """Create a successful JSON-RPC response"""
+def create_success_response(request_id: str | int | None, result: Any) -> JsonRpcResponse:
     return JsonRpcResponse(id=request_id, result=result)
 
 
 def create_error_response(
-    request_id: Optional[Union[str, int]], 
-    code: int, 
-    message: str, 
-    data: Optional[Any] = None
+    request_id: str | int | None,
+    code: int,
+    message: str,
+    data: Any | None = None,
 ) -> JsonRpcResponse:
-    """Create an error JSON-RPC response"""
-    error = JsonRpcError(code=code, message=message, data=data)
-    return JsonRpcResponse(id=request_id, error=error.to_dict())
+    error = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return JsonRpcResponse(id=request_id, error=error)
 
 
-def parse_request(json_str: str) -> JsonRpcRequest:
-    """Parse JSON string into JsonRpcRequest object"""
+def parse_request(raw: str) -> JsonRpcRequest:
     try:
-        data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON: {e}")
-    
-    # Validate required fields
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SharedTensorProtocolError(f"Invalid JSON: {exc}") from exc
+
     if not isinstance(data, dict):
-        raise ValueError("Request must be a JSON object")
-    
-    if data.get('jsonrpc') != '2.0':
-        raise ValueError("Invalid jsonrpc version, must be '2.0'")
-    
-    if 'method' not in data:
-        raise ValueError("Missing required field 'method'")
-    
-    return JsonRpcRequest(
-        method=data['method'],
-        params=data.get('params'),
-        id=data.get('id'),
-        jsonrpc=data['jsonrpc']
-    )
+        raise SharedTensorProtocolError("Request must be a JSON object")
+    if data.get("jsonrpc") != "2.0":
+        raise SharedTensorProtocolError("Invalid jsonrpc version, expected '2.0'")
+    if not isinstance(data.get("method"), str) or not data["method"]:
+        raise SharedTensorProtocolError("Missing required field 'method'")
+    params = data.get("params")
+    if params is not None and not isinstance(params, dict):
+        raise SharedTensorProtocolError("'params' must be an object when provided")
+    return JsonRpcRequest(method=data["method"], params=params, id=data.get("id"), jsonrpc="2.0")
 
 
-def parse_response(json_str: str) -> JsonRpcResponse:
-    """Parse JSON string into JsonRpcResponse object"""
+def parse_response(raw: str) -> JsonRpcResponse:
     try:
-        data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON: {e}")
-    
-    # Validate required fields
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SharedTensorProtocolError(f"Invalid JSON: {exc}") from exc
+
     if not isinstance(data, dict):
-        raise ValueError("Response must be a JSON object")
-    
-    if data.get('jsonrpc') != '2.0':
-        raise ValueError("Invalid jsonrpc version, must be '2.0'")
-    
-    if 'id' not in data:
-        raise ValueError("Missing required field 'id'")
-    
-    # Must have either result or error
-    has_result = 'result' in data
-    has_error = 'error' in data
-    
-    if not has_result and not has_error:
-        raise ValueError("Response must have either 'result' or 'error'")
-    
-    if has_result and has_error:
-        raise ValueError("Response cannot have both 'result' and 'error'")
-    
-    return JsonRpcResponse(
-        id=data['id'],
-        result=data.get('result'),
-        error=data.get('error'),
-        jsonrpc=data['jsonrpc']
-    )
+        raise SharedTensorProtocolError("Response must be a JSON object")
+    if data.get("jsonrpc") != "2.0":
+        raise SharedTensorProtocolError("Invalid jsonrpc version, expected '2.0'")
+    if "id" not in data:
+        raise SharedTensorProtocolError("Missing required field 'id'")
+    has_result = "result" in data
+    has_error = "error" in data
+    if has_result == has_error:
+        raise SharedTensorProtocolError("Response must contain exactly one of 'result' or 'error'")
+    return JsonRpcResponse(id=data["id"], result=data.get("result"), error=data.get("error"), jsonrpc="2.0")

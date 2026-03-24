@@ -1,177 +1,138 @@
-"""
-Async Provider for Shared Tensor
+"""Async provider facade for endpoint-oriented shared_tensor usage."""
 
-Extends the provider pattern to support async task execution
-"""
+from __future__ import annotations
 
-import os
-import logging
+from collections.abc import Callable
 from functools import wraps
-from typing import Any, Dict, Callable, Optional
+from typing import Any, cast
 
-from shared_tensor.errors import SharedTensorProviderError
-from shared_tensor.provider import SharedTensorProvider
 from shared_tensor.async_client import AsyncSharedTensorClient
 from shared_tensor.async_task import TaskInfo
-
-
-__all__ = ["AsyncSharedTensorProvider"]
-
-logger = logging.getLogger(__name__)
-global_rank = int(os.getenv("RANK", 0))
+from shared_tensor.provider import SharedTensorProvider
 
 
 class AsyncSharedTensorProvider(SharedTensorProvider):
-    """
-    Async provider for shared tensor operations
-    
-    Supports both sync and async execution modes
-    """
-    
-    def __init__(self, server_port: int = 2537 + global_rank, verbose_debug: bool = False, poll_interval: float = 1.0, default_enabled: bool = True):
-        super().__init__(server_port=server_port, verbose_debug=verbose_debug, default_enabled=default_enabled)
+    def __init__(
+        self,
+        server_port: int = 2537,
+        *,
+        server_host: str = "127.0.0.1",
+        timeout: float = 30.0,
+        execution_mode: str = "client",
+        verbose_debug: bool = False,
+        poll_interval: float = 1.0,
+    ) -> None:
+        super().__init__(
+            server_port=server_port,
+            server_host=server_host,
+            timeout=timeout,
+            execution_mode=execution_mode,
+            verbose_debug=verbose_debug,
+        )
         self.poll_interval = poll_interval
-        logger.debug(f"AsyncSharedTensorProvider initialized with server port {server_port}, verbose debug {verbose_debug}, and poll interval {poll_interval}")
-        self._async_client = None
-    
-    def _get_async_client(self) -> AsyncSharedTensorClient:
-        """Get or create async client"""
-        if self._async_client is None:
-            logger.debug(f"Creating new async client with server port {self.server_port} and poll interval {self.poll_interval}")
-            self._async_client = AsyncSharedTensorClient(self.server_port, self.verbose_debug, self.poll_interval)
-            logger.debug(f"Async client created with server port {self.server_port} and poll interval {self.poll_interval}")
-        return self._async_client
-    
-    def share(self, name: Optional[str] = None, wait: bool = True, singleton: bool = True, singleton_key_formatter: Optional[str] = None):
-        """
-        Decorator to register a function for async remote sharing
-        
-        Args:
-            name: Optional custom name for the function
-            wait: Whether to wait for completion by default
-            singleton: Whether to use a singleton instance of the function result
-            singleton_key_formatter: Formatter for cached results
-        """
-        def decorator(func: Callable):
-            func_name = name or func.__name__
+        self._async_client: AsyncSharedTensorClient | None = None
 
-            if self.server_mode == "true":
-                logger.debug(f"Server mode is true, returning function {func_name} without registering")
-                return func
-            
-            if not self._enabled:
-                logger.debug(f"SharedTensor is disabled, returning function {func_name} without registering")
-                return func
+    def register(
+        self,
+        func: Callable[..., Any],
+        *,
+        name: str | None = None,
+        cache: bool = False,
+        async_default_wait: bool = True,
+        wait: bool | None = None,
+    ) -> Callable[..., Any]:
+        endpoint_name = name or func.__name__
+        resolved_wait = async_default_wait if wait is None else wait
+        registered = super().register(
+            func,
+            name=endpoint_name,
+            cache=cache,
+            async_default_wait=resolved_wait,
+        )
+        if self.execution_mode in {"server", "local"}:
+            return registered
 
-            logger.debug(f"Server mode is false, registering function {func_name}")
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if resolved_wait:
+                return self.call(endpoint_name, *args, **kwargs)
+            return self.submit(endpoint_name, *args, **kwargs)
 
-            function_path = self._get_function_path(func)
-            logger.debug(f"Function {func_name} registered with function path {function_path}")
-            
-            options = {
-                'name': func_name,
-                'singleton': singleton,
-                'singleton_key_formatter': singleton_key_formatter,
-            }
+        wrapped = cast(Any, wrapper)
+        wrapped.submit_async = lambda *args, **kwargs: self.submit(endpoint_name, *args, **kwargs)
+        wrapped.execute_async = lambda *args, wait=resolved_wait, timeout=None, callback=None, **kwargs: self.execute(
+            endpoint_name,
+            *args,
+            wait=wait,
+            timeout=timeout,
+            callback=callback,
+            **kwargs,
+        )
+        return cast(Callable[..., Any], wrapped)
 
-            function_info = {
-                'name': func_name,
-                'function_path': function_path,
-                'options': options,
-                'async_default_wait': wait
-            }
-            
-            self._registered_functions[func_name] = function_info
-            
-            @wraps(func)
-            def wrapper(*args, **kwargs):
-                return self._execute_async_function(func_name, args, kwargs, options)
-            
-            wrapper.submit_async = lambda *args, **kwargs: self._submit_async_function(func_name, args, kwargs, options)
-            wrapper.execute_async = lambda *args, wait=wait, timeout=None, callback=None, **kwargs: \
-                self._execute_async_function_with_options(func_name, args, kwargs, options, wait, timeout, callback)
-            
-            return wrapper
+    def share(
+        self,
+        name: str | None = None,
+        cache: bool = False,
+        **_: Any,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            return self.register(func, name=name, cache=cache)
+
         return decorator
-    
-    def _submit_async_function(self, func_name: str, args: tuple, kwargs: dict, options: dict) -> str:
-        """Submit function for async execution, return task ID"""
-        try:
-            if func_name not in self._registered_functions:
-                raise SharedTensorProviderError(f"Function {func_name} not registered")
-            
-            function_info = self._registered_functions[func_name]
-            function_path = function_info['function_path']
-            
-            async_client = self._get_async_client()
-            logger.debug(f"Submitting async function {func_name} with function path {function_path} and options {options}")
-            return async_client.submit_task(function_path, args, kwargs, options)
-                
-        except Exception as e:
-            raise SharedTensorProviderError(f"Failed to submit async function {func_name}: {str(e)}")
-    
-    def _execute_async_function(self, func_name: str, args: tuple, kwargs: dict, options: dict) -> Any:
-        """Execute function using default async settings"""
-        function_info = self._registered_functions[func_name]
-        wait = function_info.get('async_default_wait', True)
-        if wait:
-            return self._execute_async_function_with_options(func_name, args, kwargs, options, True, None, None)
-        else:
-            return self._submit_async_function(func_name, args, kwargs, options)
-    
-    def _execute_async_function_with_options(self, func_name: str, args: tuple, kwargs: dict, options: dict,
-                                           wait: bool, timeout: Optional[float], 
-                                           callback: Optional[Callable[[TaskInfo], None]]) -> Any:
-        """Execute function with specific async options"""
-        try:
-            if func_name not in self._registered_functions:
-                raise SharedTensorProviderError(f"Function {func_name} not registered")
-            
-            function_info = self._registered_functions[func_name]
-            function_path = function_info['function_path']
-            
-            async_client = self._get_async_client()
-            logger.debug(f"Executing async function {func_name} with function path {function_path} and options {options}")
-            return async_client.execute_function_async(function_path, args, kwargs, options, wait, timeout, callback)
-        except Exception as e:
-            raise SharedTensorProviderError(f"Failed to execute async function {func_name}: {str(e)}")
-    
+
+    def _get_async_client(self) -> AsyncSharedTensorClient:
+        if self._async_client is None:
+            self._async_client = AsyncSharedTensorClient(
+                port=self.server_port,
+                host=self.server_host,
+                timeout=self.timeout,
+                verbose_debug=self.verbose_debug,
+                poll_interval=self.poll_interval,
+            )
+        return self._async_client
+
+    def submit(self, endpoint: str, *args: Any, **kwargs: Any) -> str:
+        if self.execution_mode == "local":
+            raise RuntimeError("Local mode does not support async task submission")
+        return self._get_async_client().submit(endpoint, *args, **kwargs)
+
+    def execute(
+        self,
+        endpoint: str,
+        *args: Any,
+        wait: bool = True,
+        timeout: float | None = None,
+        callback: Callable[[TaskInfo], None] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        task_id = self.submit(endpoint, *args, **kwargs)
+        if not wait:
+            return task_id
+        return self.wait_for_task(task_id, timeout=timeout, callback=callback)
+
     def get_task_status(self, task_id: str) -> TaskInfo:
-        """Get status of a task"""
-        async_client = self._get_async_client()
-        logger.debug(f"Getting status of task {task_id}")
-        return async_client.get_task_status(task_id)
-    
+        return self._get_async_client().get_task_status(task_id)
+
     def get_task_result(self, task_id: str) -> Any:
-        """Get result of a completed task"""
-        async_client = self._get_async_client()
-        logger.debug(f"Getting result of task {task_id}")
-        return async_client.get_task_result(task_id)
-    
-    def wait_for_task(self, task_id: str, timeout: Optional[float] = None,
-                     callback: Optional[Callable[[TaskInfo], None]] = None) -> Any:
-        """Wait for a task to complete"""
-        async_client = self._get_async_client()
-        logger.debug(f"Waiting for task {task_id} with timeout {timeout} and callback {callback}")
-        return async_client.wait_for_task(task_id, timeout, callback)
-    
+        return self._get_async_client().get_task_result(task_id)
+
+    def wait_for_task(
+        self,
+        task_id: str,
+        timeout: float | None = None,
+        callback: Callable[[TaskInfo], None] | None = None,
+    ) -> Any:
+        return self._get_async_client().wait_for_task(task_id, timeout=timeout, callback=callback)
+
     def cancel_task(self, task_id: str) -> bool:
-        """Cancel a task"""
-        async_client = self._get_async_client()
-        logger.debug(f"Cancelling task {task_id}")
-        return async_client.cancel_task(task_id)
-    
-    def list_tasks(self, status: Optional[str] = None) -> Dict[str, TaskInfo]:
-        """List tasks on the server"""
-        async_client = self._get_async_client()
-        logger.debug(f"Listing tasks with status {status}")
-        return async_client.list_tasks(status)
-    
-    def close(self):
-        """Close the provider and its clients"""
+        return self._get_async_client().cancel_task(task_id)
+
+    def list_tasks(self, status: str | None = None) -> dict[str, TaskInfo]:
+        return self._get_async_client().list_tasks(status=status)
+
+    def close(self) -> None:
         super().close()
-        if self._async_client:
-            logger.debug(f"Closing async client")
+        if self._async_client is not None:
             self._async_client.close()
-            logger.debug(f"Async client closed")
             self._async_client = None

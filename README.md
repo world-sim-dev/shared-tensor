@@ -1,379 +1,125 @@
 # Shared Tensor
 
-[![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://python.org)
-[![PyTorch](https://img.shields.io/badge/PyTorch-1.12%2B-orange.svg)](https://pytorch.org)
-[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
+`shared_tensor` 只做一件事：在同一台机器上，用原生 PyTorch 语义，把 CUDA `torch.Tensor` 和 CUDA `torch.nn.Module` 在两个进程之间传过去用。
 
-A high-performance library for sharing GPU memory objects across processes using IPC mechanisms with JSON-RPC 2.0 protocol, enabling model and inference engine separation architecture.
+不做这些事：
 
-## 🚀 Project Overview
+- 不支持 CPU tensor 传输
+- 不支持普通 Python 对象 RPC
+- 不支持 macOS `mps`
+- 不做跨机器分布式传输
 
-Shared Tensor is a cross-process communication library designed specifically for deep learning and AI applications, utilizing IPC mechanisms and JSON-RPC protocol to achieve:
+## Scope
 
-- **Efficient GPU Memory Sharing**: Cross-process sharing of PyTorch tensors and models
-- **Remote Function Execution**: Easy remote function calls through decorators
-- **Async/Sync Support**: Flexible execution modes for different scenarios
-- **Model Serving**: Deploy machine learning models as independent services
-- **Distributed Inference**: Support for distributed computing in multi-GPU environments
+- 同机
+- 同 GPU
+- 信任环境
+- native torch
+- 端点显式注册
 
-## 📋 Core Features
+## Payload Rules
 
-### 🔄 Cross-Process Communication
-- **JSON-RPC 2.0 Protocol**: Standardized remote procedure calls
-- **HTTP Transport**: Reliable HTTP-based communication mechanism
-- **Serialization Optimization**: Efficient PyTorch object serialization/deserialization
+- 支持 CUDA `torch.Tensor`
+- 支持 CUDA `torch.nn.Module`
+- 支持由它们组成的 `tuple` / `list` / `dict[str, ...]`，用于 `args` 和 `kwargs`
+- 空 `args` / `kwargs` 允许走一个极小的 control path，只用于无参调用
 
-### 🎯 Function Sharing
-- **Decorator Pattern**: Easy function sharing using `@provider.share`
-- **Auto Discovery**: Smart function path resolution and import
-- **Parameter Passing**: Support for complex data type parameters
+下面这些会直接失败：
 
-### ⚡ Async Support
-- **Async Execution**: `AsyncSharedTensorProvider` supports non-blocking calls
-- **Task Management**: Complete async task status tracking
-- **Concurrent Processing**: Efficient concurrent request handling
+- CPU tensor
+- CPU module
+- 普通 `dict` / `list` / `int` / `str` 等 Python 对象
+- `mps` tensor / `mps` module
 
-### 🖥️ GPU Compatibility
-- **CUDA Support**: Native CUDA tensor sharing support
-- **Device Management**: Smart data migration between devices
-- **Memory Optimization**: Efficient GPU memory usage
+## Install
 
-## 🛠️ Installation Guide
-
-### Requirements
-
-- **Python**: 3.8+
-- **Operating System**: Linux (recommended)
-- **PyTorch**: 1.12.0+
-- **CUDA**: Optional, for GPU support
-
-### Installation Methods
-
-#### Install from Pypi
+需要 Python `3.10+` 和可用的 CUDA 版 PyTorch。
 
 ```bash
-pip install shared-tensor
+pip install -e ".[dev,test]"
 ```
 
-#### Install from Source
+## Minimal Example
 
-```bash
-# Clone the repository
-git clone https://github.com/world-sim-dev/shared-tensor.git
-cd shared-tensor
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install the package
-pip install -e .
-```
-
-#### Development Installation
-
-```bash
-# Install with development dependencies
-pip install -e ".[dev]"
-
-# Install with test dependencies
-pip install -e ".[test]"
-```
-
-### Verify Installation
-
-```bash
-# Check core functionality
-python -c "import shared_tensor; print('✓ Shared Tensor installed successfully')"
-```
-
-## 🎯 Quick Start
-
-### 1. Basic Function Sharing
-
-```python
-from shared_tensor.async_provider import AsyncSharedTensorProvider
-
-# Create provider
-provider = AsyncSharedTensorProvider()
-
-# Share simple function
-@provider.share()
-def add_numbers(a, b):
-    return a + b
-
-# Share PyTorch function
-@provider.share()
-def create_tensor(shape):
-    import torch
-    return torch.zeros(shape)
-
-# Load PyTorch model
-@provider.share()
-def load_model():
-    ...
-
-```
-
-### 2. Start Server
-
-```bash
-# Method 1: Use command line tool, single server
-shared-tensor-server
-
-# Method 2: Use torchrun
-torchrun --nproc_per_node=4 --no-python shared-tensor-server
-
-# Method 3: Custom configuration
-python shared_tensor/server.py
-```
-
-
-## 📖 Detailed Usage
-
-### Model Sharing Example
+服务端 provider：
 
 ```python
 import torch
-import torch.nn as nn
 
-from shared_tensor.async_provider import AsyncSharedTensorProvider
+from shared_tensor import SharedTensorProvider
 
-# Create provider
-provider = AsyncSharedTensorProvider()
+provider = SharedTensorProvider(execution_mode="client")
 
-# Define model
-class SimpleNet(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super().__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_size, output_size)
-    
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        return x
 
-# Share model creation function
-@provider.share(name="create_model")
-def create_model(input_size=784, hidden_size=128, output_size=10):
-    model = SimpleNet(input_size, hidden_size, output_size)
-    return model
+@provider.share(name="load_model")
+def load_model() -> torch.nn.Module:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+    return torch.nn.Linear(4, 2, device="cuda")
 
-# Share inference function
-model = create_model()
-with torch.no_grad():
-    model(input_data)
+
+@provider.share(name="echo_tensor")
+def echo_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if not tensor.is_cuda:
+        raise RuntimeError("CUDA tensor required")
+    return tensor
 ```
 
+启动服务：
 
-## 🔧 Configuration Options
+```bash
+shared-tensor-server --provider my_service:provider --host 127.0.0.1 --port 2537
+```
 
-### Server Configuration
+客户端进程直接拿 CUDA 对象：
 
 ```python
-provider = AsyncSharedTensorProvider(
-    server_port: int = 2537 + global_rank,    # Local Http Server Port
-    verbose_debug: bool = False,              # Logging more detailed params
-    poll_interval: float = 1.0,               # Check status interval only for Async provider
-    default_enabled: bool = True              # Whether enable shared-tenser and re-enable via env `export __SHARED_TENSOR_ENABLED__=true`
-)
+import torch
 
-@provider.share(
-    name: Optional[str] = None,               # name for logging and debug, when singleton enabled, as default cache key
-    wait: bool = True,                        # whether return func return or a async handler
-    singleton: bool = True,                   # whether maintain only one instance of func result
-    singleton_key_formatter: Optional[str] = None): # python template can be formatted by user function params, act as final cache key
-def get_demo_model():
-    ...
+from shared_tensor import SharedTensorClient
+
+with SharedTensorClient(port=2537) as client:
+    model = client.call("load_model")
+    x = torch.ones(1, 4, device="cuda")
+    y = model(x)
+    z = client.call("echo_tensor", x)
 ```
 
-## 🧪 Testing
+## MPS
 
-### Run Test Suite
+不能。这个项目当前产品定义就是 CUDA-only IPC。
+
+- `mps` 不是 CUDA
+- 当前运行时校验按 CUDA 写死
+- 目标能力是 PyTorch CUDA 跨进程对象共享，不是泛 GPU 抽象层
+
+所以在 macOS 上你最多只能做非目标场景的单进程实验，不能把它当成这个仓库的核心能力验证。
+
+## Development
+
+推荐环境：
 
 ```bash
-# Run all tests
-python tests/run_tests.py
-
-# Run specific category tests
-python tests/run_tests.py --category unit
-python tests/run_tests.py --category integration
-python tests/run_tests.py --category pytorch
-
-# Run only PyTorch related tests
-python tests/run_tests.py --torch-only
-
-# Verbose output
-python tests/run_tests.py --verbose
+conda create -y -n shared-tensor-dev python=3.11
+conda activate shared-tensor-dev
+pip install -e ".[dev,test]"
 ```
 
-### Test Environment Info
+默认测试：
 
 ```bash
-# Check test environment
-python tests/run_tests.py --env-info
+python -m pytest -m "not gpu"
 ```
 
-### Individual Test Files
+有 CUDA 时再跑：
 
 ```bash
-# Test tensor serialization
-python tests/pytorch_tests/test_tensor_serialization.py
-
-# Test async system
-python tests/integration/test_async_system.py
-
-# Test client
-python tests/integration/test_client.py
+python -m pytest -m gpu
 ```
 
-## 🏗️ Architecture Design
+## Repo Notes
 
-### Core Components
-
-```
-shared-tensor/
-├── shared_tensor/              # Core modules
-│   ├── server.py              # JSON-RPC server
-│   ├── client.py              # Sync client
-│   ├── provider.py            # Sync provider
-│   ├── async_client.py        # Async client
-│   ├── async_provider.py      # Async provider
-│   ├── async_task.py          # Async task management
-│   ├── jsonrpc.py            # JSON-RPC protocol implementation
-│   ├── utils.py              # Utility functions
-│   └── errors.py             # Exception definitions
-├── examples/                  # Usage examples
-└── tests/                     # Test suite
-```
-
-### Communication Flow
-
-```mermaid
-sequenceDiagram
-    participant CA as Client App
-    participant SC as SharedTensorClient
-    participant SS as SharedTensorServer
-    participant FE as Function Executor
-    
-    Note over CA, FE: Client-Server Communication Flow
-    
-    CA->>SC: call_function("model_inference", args)
-    SC->>SC: Serialize parameters
-    SC->>SS: HTTP POST /jsonrpc<br/>JSON-RPC Request
-    
-    Note over SS: Server Processing
-    SS->>SS: Parse JSON-RPC request
-    SS->>SS: Resolve function path
-    SS->>FE: Import & execute function
-    FE->>FE: Deserialize parameters
-    FE->>FE: Execute function logic
-    FE->>SS: Return execution result
-    
-    Note over SS: Response Preparation
-    SS->>SS: Serialize result
-    SS->>SS: Create JSON-RPC response
-    SS->>SC: HTTP Response<br/>JSON-RPC Result
-    
-    Note over SC: Client Processing
-    SC->>SC: Parse response
-    SC->>SC: Deserialize result
-    SC->>CA: Return final result
-    
-    Note over CA, FE: End-to-End Process Complete
-```
-
-### Debug Tips
-
-1. **Enable verbose logging**:
-```python
-import logging
-logging.basicConfig(level=logging.DEBUG)
-```
-
-2. **Use debug mode**:
-```python
-provider = SharedTensorProvider(verbose_debug=True)
-```
-
-3. **Check function paths**:
-```python
-provider = SharedTensorProvider()
-print(provider._registered_functions)
-```
-
-## 🤝 Contributing
-
-We welcome community contributions! Please follow these steps:
-
-### Development Environment Setup
-
-```bash
-# Clone repository
-git clone https://github.com/world-sim-dev/shared-tensor.git
-cd shared-tensor
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install development dependencies
-pip install -e ".[dev]"
-
-# Install pre-commit hooks
-pre-commit install
-
-# Package & Publish
-python -m pip install build
-python -m build --sdist --wheel
-python -m twine upload --repository testpypi dist/*
-python -m twine upload dist/*
-```
-
-### Code Standards
-
-```bash
-# Code formatting
-black shared_tensor/ tests/ examples/
-
-# Import sorting
-isort shared_tensor/ tests/ examples/
-
-# Static checking
-flake8 shared_tensor/
-mypy shared_tensor/
-```
-
-### Submission Process
-
-1. Fork the project and create a feature branch
-2. Write code and tests
-3. Run the complete test suite
-4. Submit a Pull Request
-
-### Test Requirements
-
-- New features must include tests
-- Maintain test coverage > 90%
-- All tests must pass
-
-## 📄 License
-
-This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details
-
-## 🙏 Acknowledgments
-
-- [PyTorch](https://pytorch.org/) - Deep learning framework
-- [JSON-RPC 2.0](https://www.jsonrpc.org/) - Remote procedure call protocol
-
-## 📞 Contact Us
-
-- **Issues**: [GitHub Issues](https://github.com/world-sim-dev/shared-tensor/issues)
-- **Documentation**: [Shared Tensor Documentation](https://github.com/world-sim-dev/shared-tensor/wiki)
-- **Source**: [GitHub Repository](https://github.com/world-sim-dev/shared-tensor)
-
----
-
-**Shared Tensor** - Making GPU memory sharing simple and efficient 🚀
+- [CLAUDE.md](/Users/mapix/workspace/shared-tensor/CLAUDE.md) 是仓库约束
+- [examples/basic_service.py](/Users/mapix/workspace/shared-tensor/examples/basic_service.py) 是最小同步示例
+- [examples/async_service.py](/Users/mapix/workspace/shared-tensor/examples/async_service.py) 是异步示例
+- [examples/model_service.py](/Users/mapix/workspace/shared-tensor/examples/model_service.py) 是模型 handoff 示例

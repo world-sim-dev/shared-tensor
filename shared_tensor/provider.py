@@ -1,160 +1,139 @@
-"""
-Shared Tensor Provider
+"""Endpoint registration for sync shared_tensor clients and servers."""
 
-This module provides a provider for sharing functions across processes using JSON-RPC.
-"""
+from __future__ import annotations
 
-import inspect
-import os
-import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Dict, Callable, Optional
-from shared_tensor.client import SharedTensorClient
-from shared_tensor.errors import SharedTensorProviderError
+from typing import Any
+
+from shared_tensor.errors import (
+    SharedTensorConfigurationError,
+    SharedTensorProviderError,
+)
+from shared_tensor.utils import infer_function_path
 
 
-__all__ = ["SharedTensorProvider"]
-
-logger = logging.getLogger(__name__)
-global_rank = int(os.getenv("RANK", 0))
+@dataclass(slots=True)
+class EndpointDefinition:
+    name: str
+    func: Callable[..., Any]
+    cache: bool = False
+    legacy_path: str | None = None
+    async_default_wait: bool = True
 
 
 class SharedTensorProvider:
+    """Explicit endpoint registry with optional client-side decorator wrappers."""
 
-    def __init__(self, server_port: int = 2537 + global_rank, verbose_debug: bool = False, default_enabled: bool = True):
-        self.server_port: int = server_port
-        self.server_mode = os.getenv("__SHARED_TENSOR_SERVER_MODE__", "false")
+    def __init__(
+        self,
+        server_port: int = 2537,
+        *,
+        server_host: str = "127.0.0.1",
+        timeout: float = 30.0,
+        execution_mode: str = "client",
+        verbose_debug: bool = False,
+    ) -> None:
+        if execution_mode not in {"client", "server", "local"}:
+            raise SharedTensorConfigurationError(
+                "execution_mode must be one of 'client', 'server', or 'local'"
+            )
+        self.server_host = server_host
+        self.server_port = server_port
+        self.timeout = timeout
+        self.execution_mode = execution_mode
         self.verbose_debug = verbose_debug
-        logger.debug(f"SharedTensorProvider initialized with server port {self.server_port}, server mode {self.server_mode}, and verbose debug {self.verbose_debug}")
-        self._registered_functions: Dict[str, Dict[str, Any]] = {}
-        self._enabled = os.getenv("__SHARED_TENSOR_ENABLED__", "true" if default_enabled else "false") == "true"
-        self._client = None
+        self._client: Any | None = None
+        self._endpoints: dict[str, EndpointDefinition] = {}
+        self._registered_functions = self._endpoints
 
-    def _get_function_path(self, func: Callable) -> str:
-        """Get the importable path of a function in format 'module.submodule:function_name'"""
-        module = inspect.getmodule(func)
-        
-        if module is None:
-            raise SharedTensorProviderError(f"Failed to get full qualified name for function {func.__name__}, function module is missing")
-        
-        module_name = module.__name__
-        
-        if module_name == "__main__":
-            if hasattr(module, '__file__') and module.__file__:
-                file_path = module.__file__
-                file_name = os.path.splitext(os.path.basename(file_path))[0]
-                # For test files, we need to include the full path
-                if 'tests' in file_path:
-                    # Extract the module path from the file path
-                    path_parts = file_path.split(os.sep)
-                    if 'tests' in path_parts:
-                        test_idx = path_parts.index('tests')
-                        module_parts = path_parts[test_idx:]
-                        # Remove .py extension from last part
-                        module_parts[-1] = os.path.splitext(module_parts[-1])[0]
-                        module_name = '.'.join(module_parts)
-                    else:
-                        module_name = file_name
-                else:
-                    module_name = file_name
-            else:
-                raise SharedTensorProviderError(f"Failed to get full qualified name for function {func.__name__}, function module file path is empty")
-        
-        if hasattr(func, '__qualname__'):
-            qualname = func.__qualname__
-            # Only reject true nested functions with <locals>, but allow test functions
-            # Test functions might have qualname like "TestClass.test_method.<locals>.test_function"
-            # but we can still use them by extracting the actual function name
-            if '<locals>' in qualname:
-                # For nested functions, try to extract the innermost function name
-                # This allows test functions defined inside test methods to work
-                func_path = func.__name__
-                logger.warning(f"Function {func.__name__} appears to be nested (qualname: {qualname}), using function name only")
-            else:
-                func_path = qualname
-        else:
-            func_path = func.__name__
-        
-        return f"{module_name}:{func_path}"
+    def register(
+        self,
+        func: Callable[..., Any],
+        *,
+        name: str | None = None,
+        cache: bool = False,
+        async_default_wait: bool = True,
+    ) -> Callable[..., Any]:
+        endpoint_name = name or func.__name__
+        if endpoint_name in self._endpoints:
+            raise SharedTensorProviderError(f"Endpoint '{endpoint_name}' is already registered")
 
-    def share(self, name: Optional[str] = None, singleton: bool = True, singleton_key_formatter: Optional[str] = None):
-        """Decorator to register a function for remote sharing
-        
-        Args:
-            name: Optional custom name for the function
-            singleton: Whether to use a singleton instance of the function result
-            singleton_key_formatter: Formatter for cached results
+        definition = EndpointDefinition(
+            name=endpoint_name,
+            func=func,
+            cache=cache,
+            legacy_path=infer_function_path(func),
+            async_default_wait=async_default_wait,
+        )
+        self._endpoints[endpoint_name] = definition
 
-        Returns:
-            Decorator function that registers the function for remote sharing
-        """
-        def decorator(func: Callable):
-            func_name = name or func.__name__
+        if self.execution_mode in {"server", "local"}:
+            return func
 
-            if self.server_mode == "true":
-                logger.debug(f"Server mode is true, returning function {func_name} without registering")
-                return func
-            
-            if not self._enabled:
-                logger.debug(f"SharedTensor is disabled, returning function {func_name} without registering")
-                return func
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return self.call(endpoint_name, *args, **kwargs)
 
-            logger.debug(f"Server mode is false, registering function {func_name}")
-            function_path = self._get_function_path(func)
-            
-            logger.debug(f"Function {func_name} registered with function path {function_path}")
-            options = {
-                'name': func_name,
-                'singleton': singleton,
-                'singleton_key_formatter': singleton_key_formatter,
-            }
-            function_info = {
-                'name': func_name,
-                'function_path': function_path,
-                'options': options,
-            }
-            self._registered_functions[func_name] = function_info
-            
-            @wraps(func)
-            def wrapper(*args, **kwargs):
-                return self._execute_remote_function(func_name, args, kwargs, options)
-            
-            return wrapper
+        return wrapper
+
+    def share(
+        self,
+        name: str | None = None,
+        cache: bool = False,
+        **_: Any,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            return self.register(func, name=name, cache=cache)
+
         return decorator
 
-    def _get_client(self) -> SharedTensorClient:
-        """Get or create JSON-RPC client"""
+    def call(self, endpoint: str, *args: Any, **kwargs: Any) -> Any:
+        if self.execution_mode == "local":
+            return self.invoke_local(endpoint, args=args, kwargs=kwargs)
+        client = self._get_client()
+        return client.call(endpoint, *args, **kwargs)
+
+    def invoke_local(
+        self,
+        endpoint: str,
+        *,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        definition = self.get_endpoint(endpoint)
+        return definition.func(*args, **(kwargs or {}))
+
+    def get_endpoint(self, endpoint: str) -> EndpointDefinition:
+        try:
+            return self._endpoints[endpoint]
+        except KeyError as exc:
+            raise SharedTensorProviderError(f"Endpoint '{endpoint}' is not registered") from exc
+
+    def list_endpoints(self) -> dict[str, dict[str, Any]]:
+        return {
+            name: {
+                "cache": definition.cache,
+                "async_default_wait": definition.async_default_wait,
+                "legacy_path": definition.legacy_path,
+            }
+            for name, definition in self._endpoints.items()
+        }
+
+    def _get_client(self) -> Any:
         if self._client is None:
-            logger.debug(f"Creating new JSON-RPC client with server port {self.server_port}")
-            self._client = SharedTensorClient(self.server_port, verbose_debug=self.verbose_debug)
-            logger.debug(f"JSON-RPC client created with server port {self.server_port}")
+            from shared_tensor.client import SharedTensorClient
+
+            self._client = SharedTensorClient(
+                port=self.server_port,
+                host=self.server_host,
+                timeout=self.timeout,
+                verbose_debug=self.verbose_debug,
+            )
         return self._client
 
-    def _execute_remote_function(self, func_name: str, args: tuple, kwargs: dict, options: dict) -> Any:
-        """Execute function remotely using JSON-RPC client"""
-        try:
-            if self.verbose_debug:
-                logger.debug(f"Executing remote function {func_name} with args {args} and kwargs {kwargs}")
-            else:
-                logger.debug(f"Executing remote function {func_name}")
-
-            if func_name not in self._registered_functions:
-                raise SharedTensorProviderError(f"Function {func_name} not registered")
-            
-            function_info = self._registered_functions[func_name]
-            function_path = function_info['function_path']
-            client = self._get_client()
-            logger.debug(f"Executing remote function {func_name} with function path {function_path} and options {options}")
-            return client.execute_function(function_path, args, kwargs, options)
-                
-        except Exception as e:
-            logger.warning(f"Failed to execute remote function {func_name}: {str(e)}")
-            raise SharedTensorProviderError(f"Failed to execute remote function {func_name}: {str(e)}")
-    
-    def close(self):
-        """Close the provider and its client connection"""
-        if self._client:
-            logger.debug(f"Closing JSON-RPC client with server port {self.server_port}")
+    def close(self) -> None:
+        if self._client is not None:
             self._client.close()
-            logger.debug(f"JSON-RPC client closed with server port {self.server_port}")
             self._client = None
