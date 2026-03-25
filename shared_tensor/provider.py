@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from shared_tensor.utils import (
 EndpointExecution = Literal["direct", "task"]
 EndpointConcurrency = Literal["parallel", "serialized"]
 SHARED_TENSOR_ENABLED_ENV = "SHARED_TENSOR_ENABLED"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -89,6 +92,8 @@ class SharedTensorProvider:
         device_index: int | None = None,
         timeout: float = 30.0,
         execution_mode: str = "auto",
+        server_process_start_method: str | None = None,
+        server_startup_timeout: float = 30.0,
         verbose_debug: bool = False,
     ) -> None:
         resolved_mode, auto_mode = _resolve_execution_mode(
@@ -101,6 +106,8 @@ class SharedTensorProvider:
         self.timeout = timeout
         self.execution_mode = resolved_mode
         self.auto_mode = auto_mode
+        self.server_process_start_method = server_process_start_method
+        self.server_startup_timeout = server_startup_timeout
         self.verbose_debug = verbose_debug
         self._client: Any | None = None
         self._async_client: Any | None = None
@@ -143,6 +150,17 @@ class SharedTensorProvider:
             singleflight=singleflight,
         )
         self._endpoints[endpoint_name] = definition
+        if self.verbose_debug:
+            logger.debug(
+                "Provider registered endpoint",
+                extra={
+                    "endpoint": endpoint_name,
+                    "execution_mode": self.execution_mode,
+                    "execution": execution,
+                    "managed": managed,
+                    "cache": cache,
+                },
+            )
 
         if self._should_autostart_server():
             self._restart_autostart_server()
@@ -195,11 +213,15 @@ class SharedTensorProvider:
         return decorator
 
     def call(self, endpoint: str, *args: Any, **kwargs: Any) -> Any:
+        if self.verbose_debug:
+            logger.debug("Provider dispatching call", extra={"endpoint": endpoint, "mode": self.execution_mode})
         if self.execution_mode in {"server", "local"}:
             return self.invoke_local(endpoint, args=args, kwargs=kwargs)
         return self._get_client().call(endpoint, *args, **kwargs)
 
     def submit(self, endpoint: str, *args: Any, **kwargs: Any) -> str:
+        if self.verbose_debug:
+            logger.debug("Provider submitting task", extra={"endpoint": endpoint, "mode": self.execution_mode})
         if self.execution_mode in {"server", "local"}:
             raise RuntimeError("Local and server modes do not support task submission")
         return self._get_async_client().submit(endpoint, *args, **kwargs)
@@ -279,6 +301,8 @@ class SharedTensorProvider:
         }
 
     def close(self) -> None:
+        if self.verbose_debug:
+            logger.debug("Provider closing resources", extra={"mode": self.execution_mode})
         if self._client is not None:
             self._client.close()
             self._client = None
@@ -288,6 +312,28 @@ class SharedTensorProvider:
         if self._server is not None:
             self._server.stop()
             self._server = None
+
+    def get_runtime_info(self) -> dict[str, Any]:
+        if self.execution_mode in {"server", "local"}:
+            return {
+                "execution_mode": self.execution_mode,
+                "auto_mode": self.auto_mode,
+                "base_path": self.base_path,
+                "device_index": self.device_index,
+                "server_socket_path": resolve_runtime_socket_path(self.base_path, self.device_index),
+                "server_running": self._server is not None,
+            }
+        server_info = self._get_client().get_server_info()
+        return {
+            "execution_mode": self.execution_mode,
+            "auto_mode": self.auto_mode,
+            "base_path": self.base_path,
+            "device_index": self.device_index,
+            "server_socket_path": server_info.get("socket_path"),
+            "server_running": bool(server_info.get("running")),
+            "server_ready": bool(server_info.get("ready")),
+            "server_info": server_info,
+        }
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -319,11 +365,21 @@ class SharedTensorProvider:
     def _restart_autostart_server(self) -> None:
         from shared_tensor.server import SharedTensorServer
 
+        if self.verbose_debug:
+            logger.debug(
+                "Provider restarting autostart server",
+                extra={
+                    "socket_path": resolve_runtime_socket_path(self.base_path, self.device_index),
+                    "process_start_method": self.server_process_start_method,
+                },
+            )
         if self._server is not None:
             self._server.stop()
         self._server = SharedTensorServer(
             self,
             socket_path=resolve_runtime_socket_path(self.base_path, self.device_index),
+            process_start_method=self.server_process_start_method,
+            startup_timeout=self.server_startup_timeout,
             verbose_debug=self.verbose_debug,
         )
         self._server.start(blocking=False)

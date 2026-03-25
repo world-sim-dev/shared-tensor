@@ -10,7 +10,7 @@ from shared_tensor import (
     SharedObjectHandle,
 )
 from shared_tensor.async_task import TaskStatus
-from shared_tensor.errors import SharedTensorTaskError
+from shared_tensor.errors import SharedTensorRemoteError, SharedTensorTaskError
 
 torch = pytest.importorskip("torch")
 
@@ -152,3 +152,45 @@ def test_async_provider_wait_false_uses_submit_wrapper(monkeypatch: pytest.Monke
     assert build(3) == "task-123"
     assert build.submit_async(4) == "task-123"
     assert calls == [("build", (3,), {}), ("build", (4,), {})]
+
+
+def test_async_cached_submit_reuses_server_result(running_server) -> None:
+    provider = AsyncSharedTensorProvider(execution_mode="server")
+
+    @provider.share(wait=False, managed=True, cache_format_key="fixed")
+    def build_tensor(version: int) -> torch.Tensor:
+        return torch.full((1,), float(version), device="cuda")
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    server = running_server(provider)
+
+    with _client(server) as client:
+        first_task = client.submit("build_tensor", version=1)
+        second_task = client.submit("build_tensor", version=1)
+        first = client.wait_for_task(first_task, timeout=2)
+        second = client.wait_for_task(second_task, timeout=2)
+        assert isinstance(first, SharedObjectHandle)
+        assert isinstance(second, SharedObjectHandle)
+        assert first.object_id == second.object_id
+        assert first.release() is True
+        assert second.release() is True
+
+
+def test_async_client_wait_uses_structured_task_error_code() -> None:
+    client = AsyncSharedTensorClient(base_path="/tmp/shared-tensor-test", device_index=0)
+
+    def fake_wait_task(task_id, timeout=None):
+        raise SharedTensorRemoteError(
+            "Remote error [5]: boom",
+            code=5,
+            error_type="SharedTensorTaskError",
+        )
+
+    client._client.wait_task = fake_wait_task
+    try:
+        with pytest.raises(SharedTensorTaskError, match="boom"):
+            client.wait_for_task("task-1", timeout=0.1)
+    finally:
+        client.close()

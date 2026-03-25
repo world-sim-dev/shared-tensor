@@ -125,6 +125,10 @@ def test_server_get_server_info_contains_metadata() -> None:
 
     assert info["server"] == "SharedTensorServer"
     assert info["socket_path"].endswith("-0.sock")
+    assert info["running"] is False
+    assert info["ready"] is False
+    assert info["process_start_method"] is None
+    assert info["device_index"] == 0
     assert "load" in info["endpoints"]
     assert info["capabilities"]["transport"] == "same-host-cuda-torch-ipc"
 
@@ -158,3 +162,35 @@ def test_server_handle_connection_returns_error_frame_for_invalid_request() -> N
         right.close()
 
     assert payload
+
+
+def test_server_serialize_error_includes_type() -> None:
+    server = SharedTensorServer(SharedTensorProvider(execution_mode="server"))
+
+    payload = server._serialize_error(SharedTensorTaskError("boom"))
+
+    assert payload == {
+        "code": 5,
+        "message": "boom",
+        "type": "SharedTensorTaskError",
+        "data": None,
+    }
+
+
+def test_server_resolve_process_start_method_prefers_fork_without_main_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = SharedTensorServer(SharedTensorProvider(execution_mode="server"))
+    monkeypatch.setattr("shared_tensor.server.os.name", "posix")
+    monkeypatch.setattr("shared_tensor.server.mp.get_all_start_methods", lambda: ["fork", "spawn"])
+    monkeypatch.delattr("__main__.__file__", raising=False)
+
+    assert server._resolve_process_start_method() == "fork"
+
+
+def test_server_resolve_process_start_method_accepts_explicit_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = SharedTensorServer(
+        SharedTensorProvider(execution_mode="server"),
+        process_start_method="spawn",
+    )
+    monkeypatch.setattr("shared_tensor.server.mp.get_all_start_methods", lambda: ["fork", "spawn"])
+
+    assert server._resolve_process_start_method() == "spawn"

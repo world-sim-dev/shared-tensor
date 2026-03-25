@@ -6,6 +6,7 @@ import cloudpickle
 import logging
 import multiprocessing as mp
 import os
+import sys
 import socket
 import threading
 import time
@@ -30,6 +31,7 @@ from shared_tensor.utils import (
     build_cache_key,
     capability_snapshot,
     deserialize_payload,
+    resolve_device_index,
     resolve_runtime_socket_path,
     serialize_payload,
     unlink_socket_path,
@@ -53,6 +55,8 @@ class SharedTensorServer:
         max_request_bytes: int = 64 * 1024 * 1024,
         max_workers: int = 4,
         result_ttl: float = 3600.0,
+        process_start_method: str | None = None,
+        startup_timeout: float = 30.0,
         verbose_debug: bool = False,
     ) -> None:
         self.provider = provider or SharedTensorProvider(execution_mode="server")
@@ -64,8 +68,11 @@ class SharedTensorServer:
         self.verbose_debug = verbose_debug
         self.max_workers = max_workers
         self.result_ttl = result_ttl
+        self.process_start_method = process_start_method
+        self.startup_timeout = startup_timeout
         self.listener: socket.socket | None = None
         self.server_process: Any | None = None
+        self._resolved_process_start_method: str | None = None
         self.running = False
         self.started_at: float | None = None
         self.stats = {
@@ -80,6 +87,8 @@ class SharedTensorServer:
         self._coordination_lock = threading.RLock()
 
     def process_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self.verbose_debug:
+            logger.debug("Server processing request", extra={"method": request.get("method")})
         try:
             method = request.get("method")
             if not isinstance(method, str) or not method:
@@ -92,13 +101,7 @@ class SharedTensorServer:
         except Exception as exc:
             self.stats["errors_encountered"] += 1
             logger.exception("Failed to process request")
-            return {
-                "ok": False,
-                "error": {
-                    "code": self._error_code_for(exc),
-                    "message": str(exc),
-                },
-            }
+            return {"ok": False, "error": self._serialize_error(exc)}
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "ping":
@@ -137,6 +140,8 @@ class SharedTensorServer:
 
     def _handle_call(self, params: dict[str, Any]) -> dict[str, Any]:
         endpoint, args, kwargs = self._decode_call_params(params)
+        if self.verbose_debug:
+            logger.debug("Server handling call", extra={"endpoint": endpoint})
         definition = self.provider.get_endpoint(endpoint)
         if definition.execution == "task":
             task_info = self._submit_endpoint_task(endpoint, definition, args, kwargs)
@@ -145,11 +150,15 @@ class SharedTensorServer:
 
     def _handle_submit(self, params: dict[str, Any]) -> dict[str, Any]:
         endpoint, args, kwargs = self._decode_call_params(params)
+        if self.verbose_debug:
+            logger.debug("Server handling submit", extra={"endpoint": endpoint})
         definition = self.provider.get_endpoint(endpoint)
         return self._submit_endpoint_task(endpoint, definition, args, kwargs).to_dict()
 
     def _wait_task(self, params: dict[str, Any]) -> dict[str, Any]:
         task_id = self._require_task_id(params)
+        if self.verbose_debug:
+            logger.debug("Server waiting for task", extra={"task_id": task_id})
         timeout = params.get("timeout")
         if timeout is not None and not isinstance(timeout, (int, float)):
             raise SharedTensorProtocolError("'timeout' must be a number when provided")
@@ -188,12 +197,18 @@ class SharedTensorServer:
         if cache_key is not None:
             cached = self._lookup_cached_result(definition, cache_key)
             if cached is not None:
+                if self.verbose_debug:
+                    logger.debug("Server cache hit", extra={"endpoint": endpoint, "cache_key": cache_key})
                 return cached
 
         inflight_key = cache_key if cache_key is not None and definition.singleflight else None
         if inflight_key is not None:
             future, owner = self._acquire_inflight(inflight_key)
+            if self.verbose_debug and owner:
+                logger.debug("Server created singleflight entry", extra={"endpoint": endpoint, "cache_key": inflight_key})
             if not owner:
+                if self.verbose_debug:
+                    logger.debug("Server joined singleflight entry", extra={"endpoint": endpoint, "cache_key": inflight_key})
                 if definition.managed:
                     payload = future.result()
                     object_id = payload.get("object_id")
@@ -245,6 +260,8 @@ class SharedTensorServer:
         if definition.managed:
             return self._materialize_managed_result(endpoint, definition, args, kwargs, cache_key)
         value = definition.func(*args, **kwargs)
+        if self.verbose_debug:
+            logger.debug("Server executed direct endpoint", extra={"endpoint": endpoint})
         result = self._encode_result(value)
         if cache_key is not None:
             self._cache[cache_key] = result
@@ -265,6 +282,8 @@ class SharedTensorServer:
                 return self._encode_result(cached.value, object_id=cached.object_id)
 
         result = definition.func(*args, **kwargs)
+        if self.verbose_debug:
+            logger.debug("Server created managed object", extra={"endpoint": endpoint, "cache_key": cache_key})
         entry = self._managed_objects.register(endpoint=endpoint, value=result, cache_key=cache_key)
         return self._encode_result(entry.value, object_id=entry.object_id)
 
@@ -327,6 +346,8 @@ class SharedTensorServer:
 
     def _handle_release_object(self, params: dict[str, Any]) -> dict[str, Any]:
         object_id = self._require_object_id(params)
+        if self.verbose_debug:
+            logger.debug("Server releasing managed object", extra={"object_id": object_id})
         result = self._managed_objects.release(object_id)
         return {
             "object_id": object_id,
@@ -408,23 +429,55 @@ class SharedTensorServer:
             "version": "0.2.4",
             "socket_path": self.socket_path,
             "uptime": uptime,
+            "running": self.running,
+            "ready": self.running and self.listener is not None,
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "device_index": resolve_device_index(self.provider.device_index),
+            "process_start_method": self._resolved_process_start_method,
             "stats": dict(self.stats),
             "capabilities": capability_snapshot(),
             "endpoints": list(self.provider.list_endpoints().keys()),
         }
 
+    def _serialize_error(self, exc: Exception) -> dict[str, Any]:
+        return {
+            "code": self._error_code_for(exc),
+            "message": str(exc),
+            "type": type(exc).__name__,
+            "data": None,
+        }
+
+    def _resolve_process_start_method(self) -> str:
+        if self.process_start_method is not None:
+            allowed = set(mp.get_all_start_methods())
+            if self.process_start_method not in allowed:
+                raise SharedTensorConfigurationError(
+                    f"Unsupported process_start_method '{self.process_start_method}'"
+                )
+            return self.process_start_method
+        if os.name != "posix":
+            return "spawn"
+        if not hasattr(sys.modules.get("__main__"), "__file__"):
+            return "fork"
+        return "spawn"
+
     def start(self, blocking: bool = True) -> None:
+        if self.verbose_debug:
+            logger.info("Server starting", extra={"socket_path": self.socket_path, "blocking": blocking})
         if self.running:
             raise SharedTensorConfigurationError("Server is already running")
         if blocking:
+            self._resolved_process_start_method = None
             self._serve_forever()
             return
         if os.name != "posix":
             raise SharedTensorConfigurationError(
                 "Non-blocking shared_tensor servers require POSIX multiprocessing support"
             )
+        start_method = self._resolve_process_start_method()
         payload = cloudpickle.dumps(self.provider)
-        process = mp.get_context("spawn").Process(
+        process = mp.get_context(start_method).Process(
             target=self._serve_forever_from_payload,
             args=(
                 payload,
@@ -433,11 +486,18 @@ class SharedTensorServer:
                 self.max_workers,
                 self.result_ttl,
                 self.verbose_debug,
+                start_method,
             ),
             name=f"shared-tensor-daemon:{self.socket_path}",
         )
         process.start()
+        if self.verbose_debug:
+            logger.info(
+                "Server spawned background process",
+                extra={"socket_path": self.socket_path, "pid": process.pid, "start_method": start_method},
+            )
         self.server_process = process
+        self._resolved_process_start_method = start_method
         self.running = True
         self.started_at = time.time()
 
@@ -449,6 +509,7 @@ class SharedTensorServer:
         max_workers: int,
         result_ttl: float,
         verbose_debug: bool,
+        process_start_method: str | None,
     ) -> None:
         SharedTensorServer._configure_cuda_runtime()
         provider = cloudpickle.loads(payload)
@@ -458,8 +519,10 @@ class SharedTensorServer:
             max_request_bytes=max_request_bytes,
             max_workers=max_workers,
             result_ttl=result_ttl,
+            process_start_method=process_start_method,
             verbose_debug=verbose_debug,
         )
+        server._resolved_process_start_method = process_start_method
         server._serve_forever()
 
     def _serve_forever(self) -> None:
@@ -468,6 +531,8 @@ class SharedTensorServer:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(self.socket_path)
         listener.listen()
+        if self.verbose_debug:
+            logger.info("Server listening", extra={"socket_path": self.socket_path})
         self.listener = listener
         self.running = True
         self.started_at = time.time()
@@ -492,15 +557,11 @@ class SharedTensorServer:
                     raise SharedTensorProtocolError("Transport request must be a dict")
                 response = self.process_request(request)
             except Exception as exc:
-                response = {
-                    "ok": False,
-                    "error": {
-                        "code": self._error_code_for(exc),
-                        "message": str(exc),
-                    },
-                }
+                response = {"ok": False, "error": self._serialize_error(exc)}
             try:
                 send_message(conn, response)
+                if self.verbose_debug:
+                    logger.debug("Server sent response", extra={"ok": response.get("ok")})
             except OSError:
                 logger.debug("Client disconnected before response could be sent", exc_info=True)
 
@@ -517,6 +578,8 @@ class SharedTensorServer:
             torch.cuda.set_device(local_rank)
 
     def stop(self) -> None:
+        if self.verbose_debug:
+            logger.info("Server stopping", extra={"socket_path": self.socket_path})
         if not self.running:
             unlink_socket_path(self.socket_path)
             return

@@ -111,6 +111,44 @@ def test_client_send_request_surfaces_remote_error(monkeypatch: pytest.MonkeyPat
         client.close()
 
 
+def test_client_send_request_preserves_structured_remote_error_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = SharedTensorClient(device_index=0)
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+        def settimeout(self, timeout):
+            return None
+
+        def connect(self, path):
+            return None
+
+    monkeypatch.setattr("socket.socket", lambda *args, **kwargs: FakeSocket())
+    monkeypatch.setattr(
+        "shared_tensor.client.send_message",
+        lambda sock, payload: None,
+    )
+    monkeypatch.setattr(
+        "shared_tensor.client.recv_message",
+        lambda sock: {
+            "ok": False,
+            "error": {"code": 5, "message": "boom", "type": "SharedTensorTaskError", "data": None},
+        },
+    )
+
+    try:
+        with pytest.raises(SharedTensorRemoteError) as exc_info:
+            client._request("ping")
+        assert exc_info.value.code == 5
+        assert exc_info.value.error_type == "SharedTensorTaskError"
+    finally:
+        client.close()
+
+
 def test_client_ping_returns_false_on_client_error(monkeypatch: pytest.MonkeyPatch) -> None:
     client = SharedTensorClient(device_index=0)
     try:

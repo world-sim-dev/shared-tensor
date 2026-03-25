@@ -265,8 +265,16 @@ def test_auto_server_mode_calls_shared_function_locally(monkeypatch: pytest.Monk
     events: list[str] = []
 
     class FakeServer:
-        def __init__(self, provider, *, socket_path, verbose_debug=False):
-            del provider, verbose_debug
+        def __init__(
+            self,
+            provider,
+            *,
+            socket_path,
+            process_start_method=None,
+            startup_timeout=30.0,
+            verbose_debug=False,
+        ):
+            del provider, process_start_method, startup_timeout, verbose_debug
             events.append(f"init:{socket_path}")
 
         def start(self, blocking=False):

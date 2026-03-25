@@ -116,6 +116,7 @@ Recommended settings for expensive reusable models:
 - explicit `cache_format_key`
 
 This gives one build per cache key, shared handles for identical requests, and explicit release semantics.
+Task submission uses the same server-side cache as sync `call`: repeated `submit` for the same cache key reuses the cached result instead of rebuilding the CUDA object.
 
 ## Example: Direct Tensor Path
 
@@ -146,6 +147,17 @@ SharedTensorProvider(enabled=True)
 SharedTensorProvider(enabled=False)
 SharedTensorProvider(enabled=None)
 ```
+
+Provider runtime controls:
+
+```python
+SharedTensorProvider(server_process_start_method="fork")
+SharedTensorProvider(server_startup_timeout=30.0)
+provider.get_runtime_info()
+```
+
+Use `server_process_start_method="fork"` when you explicitly want POSIX fork behavior.
+Leave it as `None` to let the library choose a safer default for the current entrypoint.
 
 `execution_mode="auto"` behaves as follows:
 - disabled: local mode
@@ -191,6 +203,16 @@ handle.release()
 ```
 
 Use managed mode for cached models or other reusable long-lived CUDA objects.
+
+## Runtime Introspection
+
+`client.get_server_info()` now returns readiness and process metadata in addition to endpoint and capability data.
+In client mode, `provider.get_runtime_info()` wraps that into a provider-oriented view.
+
+```python
+info = provider.get_runtime_info()
+# execution_mode, server_socket_path, server_running, server_ready, server_info...
+```
 
 ## Testing
 

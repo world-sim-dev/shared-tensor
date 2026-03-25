@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 __all__ = [
     "SharedTensorError",
     "SharedTensorConfigurationError",
@@ -38,6 +40,19 @@ class SharedTensorCapabilityError(SharedTensorError):
 
 class SharedTensorRemoteError(SharedTensorError):
     """Raised when the remote endpoint reports an application error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        data: Any = None,
+        error_type: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.data = data
+        self.error_type = error_type
 
 
 class SharedTensorTaskError(SharedTensorError):

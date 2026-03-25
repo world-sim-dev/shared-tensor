@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from typing import Any, cast
@@ -9,6 +10,9 @@ from typing import Any, cast
 from shared_tensor.async_task import TaskInfo, TaskStatus
 from shared_tensor.client import SharedTensorClient
 from shared_tensor.errors import SharedTensorRemoteError, SharedTensorTaskError
+
+
+logger = logging.getLogger(__name__)
 
 
 class AsyncSharedTensorClient:
@@ -31,6 +35,8 @@ class AsyncSharedTensorClient:
         )
 
     def submit(self, endpoint: str, *args: Any, **kwargs: Any) -> str:
+        if self._client.verbose_debug:
+            logger.debug("Async client submitting task", extra={"endpoint": endpoint})
         return self._client.submit(endpoint, *args, **kwargs)
 
     def status(self, task_id: str) -> TaskInfo:
@@ -51,17 +57,23 @@ class AsyncSharedTensorClient:
         timeout: float | None = None,
         callback: Callable[[TaskInfo], None] | None = None,
     ) -> Any:
+        if self._client.verbose_debug:
+            logger.debug("Async client waiting for task", extra={"task_id": task_id, "timeout": timeout})
         started = time.time()
         while True:
             remaining = None if timeout is None else max(timeout - (time.time() - started), 0.0)
             try:
                 info = TaskInfo.from_dict(self._client.wait_task(task_id, timeout=remaining))
             except SharedTensorRemoteError as exc:
-                if "Remote error [5]:" not in str(exc):
+                if exc.code != 5:
                     raise
+                if self._client.verbose_debug:
+                    logger.warning("Async client observed task failure", extra={"task_id": task_id, "code": exc.code})
                 raise SharedTensorTaskError(str(exc)) from exc
             if callback is not None:
                 callback(info)
+            if self._client.verbose_debug:
+                logger.debug("Async client polled task", extra={"task_id": task_id, "status": info.status.value})
             if info.status == TaskStatus.COMPLETED:
                 return self.result(task_id)
             if info.status == TaskStatus.FAILED:

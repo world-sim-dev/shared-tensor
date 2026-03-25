@@ -258,7 +258,16 @@ def test_env_server_role_autostarts_and_restarts_server(monkeypatch: pytest.Monk
     events: list[tuple[str, str]] = []
 
     class FakeServer:
-        def __init__(self, provider, *, socket_path, verbose_debug=False):
+        def __init__(
+            self,
+            provider,
+            *,
+            socket_path,
+            process_start_method=None,
+            startup_timeout=30.0,
+            verbose_debug=False,
+        ):
+            del process_start_method, startup_timeout, verbose_debug
             assert provider.execution_mode == "server"
             assert socket_path == "/tmp/shared-tensor-provider-0.sock"
             self.socket_path = socket_path
@@ -329,12 +338,20 @@ def test_provider_accepts_explicit_device_index_for_socket_resolution(
     monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
     monkeypatch.setenv("SHARED_TENSOR_BASE_PATH", "/tmp/shared-tensor-device")
 
-    observed_paths: list[str] = []
+    observed: list[tuple[str, str | None, float]] = []
 
     class FakeServer:
-        def __init__(self, provider, *, socket_path, verbose_debug=False):
+        def __init__(
+            self,
+            provider,
+            *,
+            socket_path,
+            process_start_method=None,
+            startup_timeout=30.0,
+            verbose_debug=False,
+        ):
             del provider, verbose_debug
-            observed_paths.append(socket_path)
+            observed.append((socket_path, process_start_method, startup_timeout))
 
         def start(self, blocking=False):
             assert blocking is False
@@ -350,7 +367,7 @@ def test_provider_accepts_explicit_device_index_for_socket_resolution(
     def build() -> None:
         return None
 
-    assert observed_paths == ["/tmp/shared-tensor-device-3.sock"]
+    assert observed == [("/tmp/shared-tensor-device-3.sock", None, 30.0)]
 
 
 def test_provider_local_cache_reuses_result_by_default_for_same_call() -> None:
@@ -420,3 +437,81 @@ def test_provider_lists_managed_endpoint_metadata() -> None:
     assert metadata["execution"] == "task"
     assert metadata["concurrency"] == "serialized"
     assert metadata["singleflight"] is True
+
+
+def test_provider_passes_server_start_options_into_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
+    monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
+
+    observed: list[tuple[str | None, float]] = []
+
+    class FakeServer:
+        def __init__(
+            self,
+            provider,
+            *,
+            socket_path,
+            process_start_method=None,
+            startup_timeout=30.0,
+            verbose_debug=False,
+        ):
+            del provider, socket_path, verbose_debug
+            observed.append((process_start_method, startup_timeout))
+
+        def start(self, blocking=False):
+            assert blocking is False
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr("shared_tensor.server.SharedTensorServer", FakeServer)
+
+    provider = SharedTensorProvider(
+        server_process_start_method="fork",
+        server_startup_timeout=12.5,
+    )
+
+    @provider.share
+    def build() -> None:
+        return None
+
+    assert observed == [("fork", 12.5)]
+
+
+def test_provider_get_runtime_info_local_mode() -> None:
+    provider = SharedTensorProvider(execution_mode="local", base_path="/tmp/runtime-info")
+
+    info = provider.get_runtime_info()
+
+    assert info == {
+        "execution_mode": "local",
+        "auto_mode": False,
+        "base_path": "/tmp/runtime-info",
+        "device_index": None,
+        "server_socket_path": "/tmp/runtime-info-0.sock",
+        "server_running": False,
+    }
+
+
+def test_provider_get_runtime_info_client_mode_uses_server_info() -> None:
+    provider = SharedTensorProvider(execution_mode="client", base_path="/tmp/runtime-info")
+
+    class FakeClient:
+        def get_server_info(self):
+            return {
+                "socket_path": "/tmp/runtime-info-0.sock",
+                "running": True,
+                "ready": True,
+            }
+
+        def close(self):
+            return None
+
+    provider._client = FakeClient()
+
+    info = provider.get_runtime_info()
+
+    assert info["execution_mode"] == "client"
+    assert info["server_socket_path"] == "/tmp/runtime-info-0.sock"
+    assert info["server_running"] is True
+    assert info["server_ready"] is True
