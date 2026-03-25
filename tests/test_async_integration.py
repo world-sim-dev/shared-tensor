@@ -98,6 +98,16 @@ def test_async_provider_defaults_to_task_execution() -> None:
     assert metadata["execution"] == "task"
 
 
+def test_async_provider_enabled_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SHARED_TENSOR_ENABLED", raising=False)
+    monkeypatch.delenv("SHARED_TENSOR_ROLE", raising=False)
+
+    provider = AsyncSharedTensorProvider(enabled=True)
+
+    assert provider.execution_mode == "client"
+    assert provider.auto_mode is True
+
+
 def test_async_provider_wait_true_uses_sync_call_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = AsyncSharedTensorProvider(execution_mode="client")
     calls = []

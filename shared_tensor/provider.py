@@ -21,6 +21,7 @@ from shared_tensor.utils import (
 
 EndpointExecution = Literal["direct", "task"]
 EndpointConcurrency = Literal["parallel", "serialized"]
+SHARED_TENSOR_ENABLED_ENV = "SHARED_TENSOR_ENABLED"
 
 
 @dataclass(slots=True)
@@ -36,8 +37,14 @@ class EndpointDefinition:
     singleflight: bool = True
 
 
-def _resolve_execution_mode(execution_mode: str) -> tuple[str, bool]:
+def _resolve_execution_mode(
+    execution_mode: str,
+    *,
+    enabled: bool | None = None,
+) -> tuple[str, bool]:
     if execution_mode == "auto":
+        if not _is_shared_tensor_enabled(enabled):
+            return "local", True
         env_role = os.getenv("SHARED_TENSOR_ROLE", "").strip().lower()
         if env_role in {"server", "client", "local"}:
             return env_role, True
@@ -47,6 +54,13 @@ def _resolve_execution_mode(execution_mode: str) -> tuple[str, bool]:
             "execution_mode must be one of 'auto', 'client', 'server', or 'local'"
         )
     return execution_mode, False
+
+
+def _is_shared_tensor_enabled(enabled: bool | None) -> bool:
+    if enabled is not None:
+        return enabled
+    raw = os.getenv(SHARED_TENSOR_ENABLED_ENV, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _validate_endpoint_options(
@@ -71,15 +85,20 @@ class SharedTensorProvider:
         self,
         base_port: int = 2537,
         *,
+        enabled: bool | None = None,
         server_host: str = "127.0.0.1",
         device_index: int | None = None,
         timeout: float = 30.0,
         execution_mode: str = "auto",
         verbose_debug: bool = False,
     ) -> None:
-        resolved_mode, auto_mode = _resolve_execution_mode(execution_mode)
+        resolved_mode, auto_mode = _resolve_execution_mode(
+            execution_mode,
+            enabled=enabled,
+        )
         self.server_host = server_host
         self.base_port = resolve_server_base_port(base_port)
+        self.enabled = enabled
         self.device_index = device_index
         self.timeout = timeout
         self.execution_mode = resolved_mode

@@ -120,13 +120,43 @@ def test_client_mode_wrapper_exposes_submit(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_auto_mode_defaults_to_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
     monkeypatch.delenv("SHARED_TENSOR_ROLE", raising=False)
     provider = SharedTensorProvider()
     assert provider.execution_mode == "client"
     assert provider.auto_mode is True
 
 
+def test_auto_mode_defaults_to_local_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SHARED_TENSOR_ENABLED", raising=False)
+    monkeypatch.delenv("SHARED_TENSOR_ROLE", raising=False)
+    provider = SharedTensorProvider()
+    assert provider.execution_mode == "local"
+    assert provider.auto_mode is True
+
+
+def test_auto_mode_provider_enabled_true_overrides_disabled_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SHARED_TENSOR_ENABLED", raising=False)
+    monkeypatch.delenv("SHARED_TENSOR_ROLE", raising=False)
+    provider = SharedTensorProvider(enabled=True)
+    assert provider.execution_mode == "client"
+    assert provider.auto_mode is True
+
+
+def test_auto_mode_provider_enabled_false_overrides_enabled_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
+    monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
+    provider = SharedTensorProvider(enabled=False)
+    assert provider.execution_mode == "local"
+    assert provider.auto_mode is True
+
+
 def test_env_server_role_autostarts_and_restarts_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
     monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
     monkeypatch.setenv("SHARED_TENSOR_BASE_PORT", "34567")
 
@@ -195,6 +225,7 @@ def test_provider_defers_port_resolution_until_client_creation(monkeypatch: pyte
 
 
 def test_provider_accepts_explicit_device_index_for_port_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
     monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
 
     observed_ports: list[int] = []

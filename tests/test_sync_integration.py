@@ -252,6 +252,7 @@ def test_server_mode_managed_endpoint_stays_local() -> None:
 
 
 def test_auto_server_mode_calls_shared_function_locally(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
     monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
     monkeypatch.setenv("SHARED_TENSOR_BASE_PORT", "2541")
 
@@ -316,7 +317,10 @@ def test_sync_client_rejects_plain_python_result_payloads(running_server) -> Non
             client.call("plain")
 
 
-def test_sync_client_rejects_plain_python_result_payloads(running_server) -> None:
+def test_sync_client_rejects_plain_python_result_payloads_with_scalar_arg(running_server) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
     provider = SharedTensorProvider(execution_mode="server")
 
     @provider.share

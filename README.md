@@ -12,6 +12,7 @@
 - task-backed slow object construction
 - endpoint-level serialization and cache-key singleflight
 - zero-branch auto mode driven by `SHARED_TENSOR_ROLE`
+- auto mode is gated by `SHARED_TENSOR_ENABLED=1`
 - port routing by `base_port + cuda_device_index`
 
 ## What It Does Not Support
@@ -53,6 +54,35 @@ conda activate shared-tensor-dev
 pip install -e ".[dev,test]"
 ```
 
+## Enabling Auto Mode
+
+`SharedTensorProvider()` now defaults to safe local mode unless you explicitly enable shared-tensor behavior.
+
+Global default:
+
+```bash
+export SHARED_TENSOR_ENABLED=1
+```
+
+Per-provider override:
+
+```python
+provider = SharedTensorProvider(enabled=True)
+provider = SharedTensorProvider(enabled=False)
+provider = SharedTensorProvider(enabled=None)
+```
+
+`enabled=None` means do not override and keep using the environment variable.
+
+Then `execution_mode="auto"` behaves like this:
+
+- `enabled=False`: provider stays in local mode
+- `enabled=True` and `SHARED_TENSOR_ROLE=server`: auto-start server and execute locally on the server side
+- `enabled=True` and no role set: provider becomes a client wrapper
+- `enabled=None`: fall back to `SHARED_TENSOR_ENABLED`
+
+This makes accidental opt-in much less likely in scripts that import shared endpoints but did not intend to start RPC behavior.
+
 ## Example 1: Zero-Branch Auto Mode
 
 See [examples/zero_branch_env.py](./examples/zero_branch_env.py).
@@ -92,17 +122,26 @@ if __name__ == "__main__":
 Run process A as the auto server:
 
 ```bash
-SHARED_TENSOR_ROLE=server python demo.py
+SHARED_TENSOR_ENABLED=1 SHARED_TENSOR_ROLE=server python demo.py
 ```
 
 Run process B as the client with the exact same file:
 
 ```bash
+SHARED_TENSOR_ENABLED=1 python demo.py
+```
+
+Equivalent stepwise form:
+
+```bash
+export SHARED_TENSOR_ENABLED=1
+SHARED_TENSOR_ROLE=server python demo.py
 python demo.py
 ```
 
 Behavior:
 
+- `SHARED_TENSOR_ENABLED=1` enables shared-tensor auto behavior for providers that keep `enabled=None`
 - `SHARED_TENSOR_ROLE=server` makes the provider auto-start a background localhost daemon
 - in the server process, shared functions still execute locally
 - in the client process, the same function names become RPC wrappers
@@ -115,6 +154,7 @@ Why this works:
 same code file
 
 Process A                               Process B
+SHARED_TENSOR_ENABLED=1                 SHARED_TENSOR_ENABLED=1
 SHARED_TENSOR_ROLE=server               SHARED_TENSOR_ROLE unset
 ----------------------------------      ----------------------------------
 provider.share(...)                     provider.share(...)

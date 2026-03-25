@@ -39,7 +39,10 @@ def _torch_forking_pickler() -> type | None:
     reductions = TORCH_MODULE.multiprocessing.reductions
     init_reductions = getattr(reductions, "init_reductions", None)
     if callable(init_reductions):
-        init_reductions()
+        try:
+            init_reductions()
+        except Exception:
+            return cast(type, mp_reduction.ForkingPickler)
     pickler = getattr(reductions, "ForkingPickler", None)
     if pickler is not None:
         return cast(type, pickler)

@@ -15,6 +15,7 @@ class AsyncSharedTensorProvider(SharedTensorProvider):
         base_port: int = 2537,
         poll_interval: float = 1.0,
         *,
+        enabled: bool | None = None,
         server_host: str = "127.0.0.1",
         device_index: int | None = None,
         timeout: float = 30.0,
@@ -23,6 +24,7 @@ class AsyncSharedTensorProvider(SharedTensorProvider):
     ) -> None:
         super().__init__(
             base_port=base_port,
+            enabled=enabled,
             server_host=server_host,
             device_index=device_index,
             timeout=timeout,
