@@ -443,7 +443,7 @@ class SharedTensorServer:
         uptime = 0.0 if self.started_at is None else time.time() - self.started_at
         return {
             "server": "SharedTensorServer",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "host": self.host,
             "port": self.port,
             "uptime": uptime,
