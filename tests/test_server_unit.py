@@ -194,3 +194,25 @@ def test_server_resolve_process_start_method_accepts_explicit_value(monkeypatch:
     monkeypatch.setattr("shared_tensor.server.mp.get_all_start_methods", lambda: ["fork", "spawn"])
 
     assert server._resolve_process_start_method() == "spawn"
+
+
+def test_server_resolve_process_start_method_prefers_spawn_after_cuda_init(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = SharedTensorServer(SharedTensorProvider(execution_mode="server"))
+
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def is_initialized() -> bool:
+            return True
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    monkeypatch.setattr("shared_tensor.server.os.name", "posix")
+    monkeypatch.setattr("__main__.__file__", "/tmp/test-main.py", raising=False)
+    monkeypatch.setitem(__import__("sys").modules, "torch", FakeTorch())
+
+    assert server._resolve_process_start_method() == "spawn"

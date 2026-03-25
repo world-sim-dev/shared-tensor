@@ -458,6 +458,12 @@ class SharedTensorServer:
             return self.process_start_method
         if os.name != "posix":
             return "spawn"
+        try:
+            import torch
+        except ImportError:
+            torch = None
+        if torch is not None and torch.cuda.is_available() and torch.cuda.is_initialized():
+            return "spawn"
         if not hasattr(sys.modules.get("__main__"), "__file__"):
             return "fork"
         return "spawn"
