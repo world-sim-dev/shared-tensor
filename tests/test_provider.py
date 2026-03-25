@@ -263,11 +263,10 @@ def test_env_server_role_autostarts_and_restarts_server(monkeypatch: pytest.Monk
             provider,
             *,
             socket_path,
-            process_start_method=None,
             startup_timeout=30.0,
             verbose_debug=False,
         ):
-            del process_start_method, startup_timeout, verbose_debug
+            del startup_timeout, verbose_debug
             assert provider.execution_mode == "server"
             assert socket_path == "/tmp/shared-tensor-provider-0.sock"
             self.socket_path = socket_path
@@ -338,7 +337,7 @@ def test_provider_accepts_explicit_device_index_for_socket_resolution(
     monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
     monkeypatch.setenv("SHARED_TENSOR_BASE_PATH", "/tmp/shared-tensor-device")
 
-    observed: list[tuple[str, str | None, float]] = []
+    observed: list[tuple[str, float]] = []
 
     class FakeServer:
         def __init__(
@@ -346,12 +345,11 @@ def test_provider_accepts_explicit_device_index_for_socket_resolution(
             provider,
             *,
             socket_path,
-            process_start_method=None,
             startup_timeout=30.0,
             verbose_debug=False,
         ):
             del provider, verbose_debug
-            observed.append((socket_path, process_start_method, startup_timeout))
+            observed.append((socket_path, startup_timeout))
 
         def start(self, blocking=False):
             assert blocking is False
@@ -367,7 +365,7 @@ def test_provider_accepts_explicit_device_index_for_socket_resolution(
     def build() -> None:
         return None
 
-    assert observed == [("/tmp/shared-tensor-device-3.sock", None, 30.0)]
+    assert observed == [("/tmp/shared-tensor-device-3.sock", 30.0)]
 
 
 def test_provider_local_cache_reuses_result_by_default_for_same_call() -> None:
@@ -396,6 +394,30 @@ def test_provider_local_cache_can_be_disabled() -> None:
     assert uncached(3) == 6
     assert uncached(4) == 8
     assert calls["value"] == 2
+
+
+def test_provider_server_mode_local_calls_use_server_cache() -> None:
+    from shared_tensor.server import SharedTensorServer
+
+    provider = SharedTensorProvider(execution_mode="server")
+    calls = {"value": 0}
+
+    class Token:
+        pass
+
+    token = Token()
+
+    @provider.share(cache_format_key="{value}")
+    def doubled(value: int):
+        calls["value"] += 1
+        return token
+
+    server = SharedTensorServer(provider)
+    assert provider._server is server
+
+    assert doubled(3) is token
+    assert doubled(3) is token
+    assert calls["value"] == 1
 
 
 def test_provider_cache_format_key_uses_bound_arguments() -> None:
@@ -443,7 +465,7 @@ def test_provider_passes_server_start_options_into_autostart(monkeypatch: pytest
     monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
     monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
 
-    observed: list[tuple[str | None, float]] = []
+    observed: list[float] = []
 
     class FakeServer:
         def __init__(
@@ -451,12 +473,11 @@ def test_provider_passes_server_start_options_into_autostart(monkeypatch: pytest
             provider,
             *,
             socket_path,
-            process_start_method=None,
             startup_timeout=30.0,
             verbose_debug=False,
         ):
             del provider, socket_path, verbose_debug
-            observed.append((process_start_method, startup_timeout))
+            observed.append(startup_timeout)
 
         def start(self, blocking=False):
             assert blocking is False
@@ -467,7 +488,6 @@ def test_provider_passes_server_start_options_into_autostart(monkeypatch: pytest
     monkeypatch.setattr("shared_tensor.server.SharedTensorServer", FakeServer)
 
     provider = SharedTensorProvider(
-        server_process_start_method="spawn",
         server_startup_timeout=12.5,
     )
 
@@ -475,29 +495,7 @@ def test_provider_passes_server_start_options_into_autostart(monkeypatch: pytest
     def build() -> None:
         return None
 
-    assert observed == [("spawn", 12.5)]
-
-
-def test_provider_pickling_drops_runtime_handles() -> None:
-    import cloudpickle
-
-    class _Closable:
-        def close(self) -> None:
-            return None
-
-        def stop(self) -> None:
-            return None
-
-    provider = SharedTensorProvider(execution_mode="server")
-    provider._client = _Closable()
-    provider._async_client = _Closable()
-    provider._server = _Closable()
-
-    restored = cloudpickle.loads(cloudpickle.dumps(provider))
-
-    assert restored._client is None
-    assert restored._async_client is None
-    assert restored._server is None
+    assert observed == [12.5]
 
 
 def test_provider_get_runtime_info_local_mode() -> None:

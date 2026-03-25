@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pickle
 import socket
+import threading
 
 import pytest
 
@@ -177,52 +178,74 @@ def test_server_serialize_error_includes_type() -> None:
     }
 
 
-def test_server_resolve_process_start_method_always_uses_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
-    server = SharedTensorServer(SharedTensorProvider(execution_mode="server"))
+def test_server_nonblocking_start_uses_background_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SharedTensorProvider(execution_mode="server", base_path="/tmp/shared-tensor-thread")
+    server = SharedTensorServer(provider, startup_timeout=1.0)
 
-    monkeypatch.setattr("shared_tensor.server.mp.get_all_start_methods", lambda: ["fork", "spawn"])
+    calls: list[threading.Event | None] = []
 
-    assert server._resolve_process_start_method() == "spawn"
+    def fake_serve_forever(*, started_event=None):
+        calls.append(started_event)
+        server.running = True
+        if started_event is not None:
+            started_event.set()
+
+    monkeypatch.setattr(server, "_serve_forever", fake_serve_forever)
+
+    server.start(blocking=False)
+
+    assert server.server_thread is not None
+    assert server._resolved_process_start_method == "thread"
+    assert len(calls) == 1
+    assert calls[0] is not None
 
 
-def test_server_resolve_process_start_method_accepts_explicit_value(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_server_nonblocking_start_rejects_process_start_method() -> None:
     server = SharedTensorServer(
         SharedTensorProvider(execution_mode="server"),
         process_start_method="spawn",
     )
-    monkeypatch.setattr("shared_tensor.server.mp.get_all_start_methods", lambda: ["fork", "spawn"])
 
-    assert server._resolve_process_start_method() == "spawn"
-
-
-def test_server_resolve_process_start_method_prefers_spawn_after_cuda_init(monkeypatch: pytest.MonkeyPatch) -> None:
-    server = SharedTensorServer(SharedTensorProvider(execution_mode="server"))
-
-    class FakeCuda:
-        @staticmethod
-        def is_available() -> bool:
-            return True
-
-        @staticmethod
-        def is_initialized() -> bool:
-            return True
-
-    class FakeTorch:
-        cuda = FakeCuda()
-
-    monkeypatch.setattr("shared_tensor.server.os.name", "posix")
-    monkeypatch.setattr("__main__.__file__", "/tmp/test-main.py", raising=False)
-    monkeypatch.setitem(__import__("sys").modules, "torch", FakeTorch())
-
-    assert server._resolve_process_start_method() == "spawn"
+    with pytest.raises(SharedTensorConfigurationError, match="thread-backed non-blocking servers"):
+        server.start(blocking=False)
 
 
-def test_server_resolve_process_start_method_rejects_non_spawn_explicit_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    server = SharedTensorServer(
-        SharedTensorProvider(execution_mode="server"),
-        process_start_method="fork",
-    )
-    monkeypatch.setattr("shared_tensor.server.mp.get_all_start_methods", lambda: ["fork", "spawn"])
+def test_server_invoke_local_reuses_direct_cache() -> None:
+    provider = SharedTensorProvider(execution_mode="server")
+    server = SharedTensorServer(provider)
+    calls = {"value": 0}
 
-    with pytest.raises(SharedTensorConfigurationError, match="only supports process_start_method='spawn'"):
-        server._resolve_process_start_method()
+    class Token:
+        pass
+
+    token = Token()
+
+    @provider.share(cache_format_key="{value}")
+    def build(value: int):
+        calls["value"] += 1
+        return token
+
+    assert server.invoke_local("build", args=(3,)) is token
+    assert server.invoke_local("build", args=(3,)) is token
+    assert calls["value"] == 1
+
+
+def test_server_invoke_local_reuses_managed_registry() -> None:
+    provider = SharedTensorProvider(execution_mode="server")
+    server = SharedTensorServer(provider)
+    calls = {"value": 0}
+
+    token = object()
+
+    @provider.share(managed=True, cache_format_key="{key}")
+    def build(key: int):
+        calls["value"] += 1
+        return token
+
+    first = server.invoke_local("build", kwargs={"key": 1})
+    second = server.invoke_local("build", kwargs={"key": 1})
+
+    assert first is token
+    assert second is token
+    assert calls["value"] == 1
+    assert len(server._managed_objects._entries) == 1

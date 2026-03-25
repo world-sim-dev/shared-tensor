@@ -23,4 +23,4 @@ Socket selection is device-aware:
 - runtime socket path is `<base_path>-<device_index>.sock`
 
 Manual mode is programmatic only: construct `SharedTensorServer(provider, socket_path=...)` and call `start()`.
-For production-style startup control, you can inspect `provider.get_runtime_info()` / `client.get_server_info()`. When using background autostart, the only supported process start method is `spawn`.
+For production-style startup control, you can inspect `provider.get_runtime_info()` / `client.get_server_info()`. Background autostart uses a thread inside the current process; explicit production servers should still use a dedicated process.

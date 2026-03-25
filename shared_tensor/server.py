@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import cloudpickle
 import logging
-import multiprocessing as mp
 import os
 import socket
 import threading
 import time
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from shared_tensor.async_task import TaskManager, TaskStatus
@@ -53,6 +51,14 @@ class _InFlightCall:
     future: Future[dict[str, Any]]
 
 
+@dataclass(slots=True)
+class _ServerThreadState:
+    thread: threading.Thread
+    ready: threading.Event = field(default_factory=threading.Event)
+    stopped: threading.Event = field(default_factory=threading.Event)
+    error: BaseException | None = None
+
+
 class SharedTensorServer:
     def __init__(
         self,
@@ -79,6 +85,7 @@ class SharedTensorServer:
         self.startup_timeout = startup_timeout
         self.listener: socket.socket | None = None
         self.server_process: Any | None = None
+        self.server_thread: _ServerThreadState | None = None
         self._resolved_process_start_method: str | None = None
         self.running = False
         self.started_at: float | None = None
@@ -88,10 +95,13 @@ class SharedTensorServer:
         }
         self._task_manager: TaskManager | None = None
         self._cache: dict[str, dict[str, Any]] = {}
+        self._local_cache: dict[str, Any] = {}
         self._managed_objects = ManagedObjectRegistry()
         self._inflight: dict[str, _InFlightCall] = {}
         self._endpoint_locks: dict[str, threading.Lock] = {}
         self._coordination_lock = threading.RLock()
+        if getattr(self.provider, "_server", None) is None:
+            self.provider._server = self
 
     def process_request(self, request: dict[str, Any]) -> dict[str, Any]:
         if self.verbose_debug:
@@ -272,6 +282,7 @@ class SharedTensorServer:
         result = self._encode_result(value)
         if cache_key is not None:
             self._cache[cache_key] = result
+            self._local_cache[cache_key] = value
         return result
 
     def _materialize_managed_result(
@@ -307,7 +318,44 @@ class SharedTensorServer:
                 return None
             self._managed_objects.add_ref(cached.object_id)
             return self._encode_result(cached.value, object_id=cached.object_id)
-        return self._cache.get(cache_key)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        local_value = self._local_cache.get(cache_key)
+        if local_value is None:
+            return None
+        encoded = self._encode_result(local_value)
+        self._cache[cache_key] = encoded
+        return encoded
+
+    def invoke_local(
+        self,
+        endpoint: str,
+        *,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        definition = self.provider.get_endpoint(endpoint)
+        resolved_kwargs = kwargs or {}
+        cache_key = self._cache_key(endpoint, definition, args, resolved_kwargs)
+        if definition.managed:
+            if cache_key is not None:
+                cached = self._managed_objects.get_cached(cache_key)
+                if cached is not None:
+                    return cached.value
+            value = definition.func(*args, **resolved_kwargs)
+            if cache_key is not None:
+                existing = self._managed_objects.get_cached(cache_key)
+                if existing is not None:
+                    return existing.value
+                self._managed_objects.register(endpoint=endpoint, value=value, cache_key=cache_key)
+            return value
+        if cache_key is not None and cache_key in self._local_cache:
+            return self._local_cache[cache_key]
+        value = definition.func(*args, **resolved_kwargs)
+        if cache_key is not None:
+            self._local_cache[cache_key] = value
+        return value
 
     def _cache_key(
         self,
@@ -455,93 +503,65 @@ class SharedTensorServer:
             "data": None,
         }
 
-    def _resolve_process_start_method(self) -> str:
-        allowed = set(mp.get_all_start_methods())
-        if "spawn" not in allowed:
-            raise SharedTensorConfigurationError(
-                "shared_tensor requires the 'spawn' multiprocessing start method"
-            )
-        if self.process_start_method is not None and self.process_start_method != "spawn":
-            raise SharedTensorConfigurationError(
-                "shared_tensor only supports process_start_method='spawn'"
-            )
-        return "spawn"
-
     def start(self, blocking: bool = True) -> None:
         if self.verbose_debug:
             logger.info("Server starting", extra={"socket_path": self.socket_path, "blocking": blocking})
-        if self.running:
+        if self.running or self.server_thread is not None:
             raise SharedTensorConfigurationError("Server is already running")
         if blocking:
             self._resolved_process_start_method = None
             self._serve_forever()
             return
-        if os.name != "posix":
+        if self.process_start_method is not None:
             raise SharedTensorConfigurationError(
-                "Non-blocking shared_tensor servers require POSIX multiprocessing support"
+                "process_start_method is not supported for thread-backed non-blocking servers"
             )
-        start_method = self._resolve_process_start_method()
-        payload = cloudpickle.dumps(self.provider)
-        process = mp.get_context(start_method).Process(
-            target=self._serve_forever_from_payload,
-            args=(
-                payload,
-                self.socket_path,
-                self.max_request_bytes,
-                self.max_workers,
-                self.result_ttl,
-                self.verbose_debug,
-                start_method,
-            ),
-            name=f"shared-tensor-daemon:{self.socket_path}",
+        thread = threading.Thread(
+            target=self._serve_forever_in_thread,
+            name=f"shared-tensor-server:{self.socket_path}",
+            daemon=True,
         )
-        process.start()
-        if self.verbose_debug:
-            logger.info(
-                "Server spawned background process",
-                extra={"socket_path": self.socket_path, "pid": process.pid, "start_method": start_method},
-            )
-        self.server_process = process
-        self._resolved_process_start_method = start_method
-        self.running = True
-        self.started_at = time.time()
+        state = _ServerThreadState(thread=thread)
+        self.server_thread = state
+        self._resolved_process_start_method = "thread"
+        thread.start()
+        if not state.ready.wait(timeout=self.startup_timeout):
+            self.stop()
+            raise TimeoutError(f"Timed out waiting for server socket {self.socket_path}")
+        if state.error is not None:
+            error = state.error
+            self.stop()
+            raise SharedTensorConfigurationError(
+                f"Failed to start background server thread for {self.socket_path}: {error}"
+            ) from error
 
-    @staticmethod
-    def _serve_forever_from_payload(
-        payload: bytes,
-        socket_path: str,
-        max_request_bytes: int,
-        max_workers: int,
-        result_ttl: float,
-        verbose_debug: bool,
-        process_start_method: str | None,
-    ) -> None:
-        SharedTensorServer._configure_cuda_runtime()
-        provider = cloudpickle.loads(payload)
-        server = SharedTensorServer(
-            provider,
-            socket_path=socket_path,
-            max_request_bytes=max_request_bytes,
-            max_workers=max_workers,
-            result_ttl=result_ttl,
-            process_start_method=process_start_method,
-            verbose_debug=verbose_debug,
-        )
-        server._resolved_process_start_method = process_start_method
-        server._serve_forever()
+    def _serve_forever_in_thread(self) -> None:
+        state = self.server_thread
+        if state is None:
+            return
+        try:
+            self._serve_forever(started_event=state.ready)
+        except BaseException as exc:  # noqa: BLE001
+            state.error = exc
+            state.ready.set()
+            raise
+        finally:
+            state.stopped.set()
 
-    def _serve_forever(self) -> None:
+    def _serve_forever(self, *, started_event: threading.Event | None = None) -> None:
         self._configure_cuda_runtime()
         unlink_socket_path(self.socket_path)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(self.socket_path)
-        listener.listen()
-        if self.verbose_debug:
-            logger.info("Server listening", extra={"socket_path": self.socket_path})
-        self.listener = listener
-        self.running = True
-        self.started_at = time.time()
         try:
+            listener.bind(self.socket_path)
+            listener.listen()
+            if self.verbose_debug:
+                logger.info("Server listening", extra={"socket_path": self.socket_path})
+            self.listener = listener
+            self.running = True
+            self.started_at = time.time()
+            if started_event is not None:
+                started_event.set()
             while self.running:
                 try:
                     conn, _ = listener.accept()
@@ -552,6 +572,8 @@ class SharedTensorServer:
                 thread = threading.Thread(target=self._handle_connection, args=(conn,), daemon=True)
                 thread.start()
         finally:
+            if started_event is not None and not started_event.is_set():
+                started_event.set()
             self._shutdown_local_resources()
 
     def _handle_connection(self, conn: socket.socket) -> None:
@@ -585,24 +607,20 @@ class SharedTensorServer:
     def stop(self) -> None:
         if self.verbose_debug:
             logger.info("Server stopping", extra={"socket_path": self.socket_path})
-        if not self.running:
-            unlink_socket_path(self.socket_path)
-            return
         self.running = False
-        if self.server_process is not None:
-            self.server_process.terminate()
-            self.server_process.join(timeout=5)
-            if self.server_process.is_alive():
-                self.server_process.kill()
-                self.server_process.join(timeout=5)
-            self.server_process = None
-            unlink_socket_path(self.socket_path)
-            return
         if self.listener is not None:
             self.listener.close()
-        self._shutdown_local_resources()
+        state = self.server_thread
+        if state is not None and state.thread.is_alive() and threading.current_thread() is not state.thread:
+            state.stopped.wait(timeout=5)
+            state.thread.join(timeout=5)
+        self.server_thread = None
+        self.server_process = None
+        if self.listener is None:
+            unlink_socket_path(self.socket_path)
 
     def _shutdown_local_resources(self) -> None:
+        self.running = False
         if self.listener is not None:
             self.listener.close()
             self.listener = None
@@ -611,6 +629,7 @@ class SharedTensorServer:
             self._task_manager = None
         self._managed_objects.clear()
         self._cache.clear()
+        self._local_cache.clear()
         self._inflight.clear()
         self._endpoint_locks.clear()
         unlink_socket_path(self.socket_path)

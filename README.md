@@ -101,7 +101,7 @@ same code
 
 server process                      client process
 ------------------------------      ------------------------------
-provider auto-starts spawn daemon   provider builds client wrappers
+provider auto-starts local thread   provider builds client wrappers
 shared function runs locally        shared function becomes RPC call
 CUDA object stays on same GPU       CUDA object is reopened via torch IPC
 ```
@@ -164,16 +164,15 @@ SharedTensorProvider(enabled=None)
 Provider runtime controls:
 
 ```python
-SharedTensorProvider(server_process_start_method="spawn")
 SharedTensorProvider(server_startup_timeout=30.0)
 provider.get_runtime_info()
 ```
 
-Only `server_process_start_method="spawn"` is supported. Leave it as `None` to use the library default, which is also `spawn`.
+Non-blocking provider autostart runs the UDS server in a background thread inside the current process.
 
 `execution_mode="auto"` behaves as follows:
 - disabled: local mode
-- enabled + `SHARED_TENSOR_ROLE=server`: auto-start a spawn-based local background server and execute endpoints locally
+- enabled + `SHARED_TENSOR_ROLE=server`: auto-start a local background server thread and execute endpoints locally
 - enabled + role unset: build client wrappers
 
 For production deployment, prefer explicit `SharedTensorServer(...).start(blocking=True)` in a dedicated server process.

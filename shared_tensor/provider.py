@@ -92,7 +92,6 @@ class SharedTensorProvider:
         device_index: int | None = None,
         timeout: float = 30.0,
         execution_mode: str = "auto",
-        server_process_start_method: str | None = None,
         server_startup_timeout: float = 30.0,
         verbose_debug: bool = False,
     ) -> None:
@@ -106,7 +105,6 @@ class SharedTensorProvider:
         self.timeout = timeout
         self.execution_mode = resolved_mode
         self.auto_mode = auto_mode
-        self.server_process_start_method = server_process_start_method
         self.server_startup_timeout = server_startup_timeout
         self.verbose_debug = verbose_debug
         self._client: Any | None = None
@@ -116,23 +114,6 @@ class SharedTensorProvider:
         self._endpoints: dict[str, EndpointDefinition] = {}
         self._registered_functions = self._endpoints
         atexit.register(self.close)
-
-    def __getstate__(self) -> dict[str, Any]:
-        state = dict(self.__dict__)
-        # Runtime handles are process-local and must not participate in daemon spawn payloads.
-        state["_client"] = None
-        state["_async_client"] = None
-        state["_server"] = None
-        return state
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        self.__dict__.update(state)
-        if "_client" not in self.__dict__:
-            self._client = None
-        if "_async_client" not in self.__dict__:
-            self._async_client = None
-        if "_server" not in self.__dict__:
-            self._server = None
 
     def register(
         self,
@@ -182,9 +163,6 @@ class SharedTensorProvider:
         if self._should_autostart_server():
             self._restart_autostart_server()
 
-        if self.execution_mode == "server":
-            return func
-
         @wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             return self.call(endpoint_name, *args, **kwargs)
@@ -232,7 +210,11 @@ class SharedTensorProvider:
     def call(self, endpoint: str, *args: Any, **kwargs: Any) -> Any:
         if self.verbose_debug:
             logger.debug("Provider dispatching call", extra={"endpoint": endpoint, "mode": self.execution_mode})
-        if self.execution_mode in {"server", "local"}:
+        if self.execution_mode == "server":
+            if self._server is not None and hasattr(self._server, "invoke_local"):
+                return self._server.invoke_local(endpoint, args=args, kwargs=kwargs)
+            return self.invoke_local(endpoint, args=args, kwargs=kwargs)
+        if self.execution_mode == "local":
             return self.invoke_local(endpoint, args=args, kwargs=kwargs)
         return self._get_client().call(endpoint, *args, **kwargs)
 
@@ -387,7 +369,6 @@ class SharedTensorProvider:
                 "Provider restarting autostart server",
                 extra={
                     "socket_path": resolve_runtime_socket_path(self.base_path, self.device_index),
-                    "process_start_method": self.server_process_start_method,
                 },
             )
         if self._server is not None:
@@ -395,7 +376,6 @@ class SharedTensorProvider:
         self._server = SharedTensorServer(
             self,
             socket_path=resolve_runtime_socket_path(self.base_path, self.device_index),
-            process_start_method=self.server_process_start_method,
             startup_timeout=self.server_startup_timeout,
             verbose_debug=self.verbose_debug,
         )

@@ -23,17 +23,17 @@ def running_server() -> Iterator:
         server.start(blocking=False)
         deadline = time.time() + 30
         while time.time() < deadline:
-            process = server.server_process
-            if process is not None and not process.is_alive() and process.exitcode is not None:
-                raise RuntimeError(
-                    f"shared_tensor server exited before becoming ready: exitcode={process.exitcode}"
-                )
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                     sock.settimeout(0.2)
                     sock.connect(server.socket_path)
                 break
             except OSError:
+                state = server.server_thread
+                if state is not None and state.error is not None:
+                    raise RuntimeError(
+                        f"shared_tensor server thread exited before becoming ready: {state.error}"
+                    ) from state.error
                 time.sleep(0.05)
         else:
             raise TimeoutError(f"Timed out waiting for server socket {server.socket_path}")

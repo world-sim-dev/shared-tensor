@@ -270,11 +270,10 @@ def test_auto_server_mode_calls_shared_function_locally(monkeypatch: pytest.Monk
             provider,
             *,
             socket_path,
-            process_start_method=None,
             startup_timeout=30.0,
             verbose_debug=False,
         ):
-            del provider, process_start_method, startup_timeout, verbose_debug
+            del provider, startup_timeout, verbose_debug
             events.append(f"init:{socket_path}")
 
         def start(self, blocking=False):
@@ -349,3 +348,58 @@ def test_sync_client_rejects_plain_python_result_payloads_with_scalar_arg(
     with client_for_server(server) as client:
         with pytest.raises(SharedTensorRemoteError):
             client.call("echo", torch.ones(1, device="cuda"), value=1)
+
+
+def test_auto_server_mode_local_and_remote_calls_share_same_cache(running_server) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    provider = SharedTensorProvider(execution_mode="server")
+    calls = {"value": 0}
+
+    @provider.share(cache_format_key="{version}")
+    def build_tensor(tensor: torch.Tensor, version: int) -> torch.Tensor:
+        calls["value"] += 1
+        return torch.full((1,), float(version), device="cuda")
+
+    server = running_server(provider)
+
+    local_first = provider.call("build_tensor", torch.ones(1, device="cuda"), version=7)
+
+    with client_for_server(server) as client:
+        remote_second = client.call("build_tensor", torch.zeros(1, device="cuda"), version=7)
+
+    assert calls["value"] == 1
+    assert torch.equal(local_first.cpu(), remote_second.cpu())
+
+
+def test_auto_server_mode_managed_local_and_remote_calls_share_same_object_registry(running_server) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    provider = SharedTensorProvider(execution_mode="server")
+    calls = {"value": 0}
+
+    @provider.share(managed=True, cache_format_key="{hidden_size}")
+    def build_model(hidden_size: int) -> torch.nn.Module:
+        calls["value"] += 1
+        return torch.nn.Linear(hidden_size, 2, device="cuda")
+
+    server = running_server(provider)
+
+    local_model = provider.call("build_model", hidden_size=4)
+
+    with client_for_server(server) as client:
+        handle = client.call("build_model", hidden_size=4)
+        assert isinstance(handle, SharedObjectHandle)
+        info = client.get_object_info(handle.object_id)
+        assert info is not None
+        assert info["refcount"] == 2
+        sample = torch.ones(1, 4, device="cuda")
+        with handle as managed:
+            remote_output = managed.value(sample)
+
+    local_output = local_model(torch.ones(1, 4, device="cuda"))
+
+    assert calls["value"] == 1
+    assert torch.equal(local_output.cpu(), remote_output.cpu())
