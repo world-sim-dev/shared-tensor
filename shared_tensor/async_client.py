@@ -8,7 +8,7 @@ from typing import Any, cast
 
 from shared_tensor.async_task import TaskInfo, TaskStatus
 from shared_tensor.client import SharedTensorClient
-from shared_tensor.errors import SharedTensorTaskError
+from shared_tensor.errors import SharedTensorRemoteError, SharedTensorTaskError
 
 
 class AsyncSharedTensorClient:
@@ -54,7 +54,12 @@ class AsyncSharedTensorClient:
         started = time.time()
         while True:
             remaining = None if timeout is None else max(timeout - (time.time() - started), 0.0)
-            info = TaskInfo.from_dict(self._client.wait_task(task_id, timeout=remaining))
+            try:
+                info = TaskInfo.from_dict(self._client.wait_task(task_id, timeout=remaining))
+            except SharedTensorRemoteError as exc:
+                if "Remote error [5]:" not in str(exc):
+                    raise
+                raise SharedTensorTaskError(str(exc)) from exc
             if callback is not None:
                 callback(info)
             if info.status == TaskStatus.COMPLETED:

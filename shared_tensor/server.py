@@ -499,7 +499,10 @@ class SharedTensorServer:
                         "message": str(exc),
                     },
                 }
-            send_message(conn, response)
+            try:
+                send_message(conn, response)
+            except OSError:
+                logger.debug("Client disconnected before response could be sent", exc_info=True)
 
     @staticmethod
     def _configure_cuda_runtime() -> None:
