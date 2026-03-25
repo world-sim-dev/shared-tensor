@@ -467,7 +467,7 @@ def test_provider_passes_server_start_options_into_autostart(monkeypatch: pytest
     monkeypatch.setattr("shared_tensor.server.SharedTensorServer", FakeServer)
 
     provider = SharedTensorProvider(
-        server_process_start_method="fork",
+        server_process_start_method="spawn",
         server_startup_timeout=12.5,
     )
 
@@ -475,7 +475,29 @@ def test_provider_passes_server_start_options_into_autostart(monkeypatch: pytest
     def build() -> None:
         return None
 
-    assert observed == [("fork", 12.5)]
+    assert observed == [("spawn", 12.5)]
+
+
+def test_provider_pickling_drops_runtime_handles() -> None:
+    import cloudpickle
+
+    class _Closable:
+        def close(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    provider = SharedTensorProvider(execution_mode="server")
+    provider._client = _Closable()
+    provider._async_client = _Closable()
+    provider._server = _Closable()
+
+    restored = cloudpickle.loads(cloudpickle.dumps(provider))
+
+    assert restored._client is None
+    assert restored._async_client is None
+    assert restored._server is None
 
 
 def test_provider_get_runtime_info_local_mode() -> None:

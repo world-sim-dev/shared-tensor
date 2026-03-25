@@ -151,13 +151,12 @@ SharedTensorProvider(enabled=None)
 Provider runtime controls:
 
 ```python
-SharedTensorProvider(server_process_start_method="fork")
+SharedTensorProvider(server_process_start_method="spawn")
 SharedTensorProvider(server_startup_timeout=30.0)
 provider.get_runtime_info()
 ```
 
-Use `server_process_start_method="fork"` when you explicitly want POSIX fork behavior.
-Leave it as `None` to let the library choose a safer default for the current entrypoint.
+Only `server_process_start_method="spawn"` is supported. Leave it as `None` to use the library default, which is also `spawn`.
 
 `execution_mode="auto"` behaves as follows:
 - disabled: local mode

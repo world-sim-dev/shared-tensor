@@ -117,6 +117,23 @@ class SharedTensorProvider:
         self._registered_functions = self._endpoints
         atexit.register(self.close)
 
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        # Runtime handles are process-local and must not participate in daemon spawn payloads.
+        state["_client"] = None
+        state["_async_client"] = None
+        state["_server"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        if "_client" not in self.__dict__:
+            self._client = None
+        if "_async_client" not in self.__dict__:
+            self._async_client = None
+        if "_server" not in self.__dict__:
+            self._server = None
+
     def register(
         self,
         func: Callable[..., Any],

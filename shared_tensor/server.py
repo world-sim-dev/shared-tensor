@@ -6,7 +6,6 @@ import cloudpickle
 import logging
 import multiprocessing as mp
 import os
-import sys
 import socket
 import threading
 import time
@@ -39,6 +38,14 @@ from shared_tensor.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _server_version() -> str:
+    try:
+        from shared_tensor import __version__
+    except ImportError:
+        return "unknown"
+    return __version__
 
 
 @dataclass(slots=True)
@@ -426,7 +433,7 @@ class SharedTensorServer:
         uptime = 0.0 if self.started_at is None else time.time() - self.started_at
         return {
             "server": "SharedTensorServer",
-            "version": "0.2.4",
+            "version": _server_version(),
             "socket_path": self.socket_path,
             "uptime": uptime,
             "running": self.running,
@@ -449,23 +456,15 @@ class SharedTensorServer:
         }
 
     def _resolve_process_start_method(self) -> str:
-        if self.process_start_method is not None:
-            allowed = set(mp.get_all_start_methods())
-            if self.process_start_method not in allowed:
-                raise SharedTensorConfigurationError(
-                    f"Unsupported process_start_method '{self.process_start_method}'"
-                )
-            return self.process_start_method
-        if os.name != "posix":
-            return "spawn"
-        try:
-            import torch
-        except ImportError:
-            torch = None
-        if torch is not None and torch.cuda.is_available() and torch.cuda.is_initialized():
-            return "spawn"
-        if not hasattr(sys.modules.get("__main__"), "__file__"):
-            return "fork"
+        allowed = set(mp.get_all_start_methods())
+        if "spawn" not in allowed:
+            raise SharedTensorConfigurationError(
+                "shared_tensor requires the 'spawn' multiprocessing start method"
+            )
+        if self.process_start_method is not None and self.process_start_method != "spawn":
+            raise SharedTensorConfigurationError(
+                "shared_tensor only supports process_start_method='spawn'"
+            )
         return "spawn"
 
     def start(self, blocking: bool = True) -> None:
