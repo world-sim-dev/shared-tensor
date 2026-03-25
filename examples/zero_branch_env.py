@@ -24,12 +24,6 @@ def load_model(hidden_size: int = 4) -> torch.nn.Module:
     return layer
 
 
-@provider.share(cache=False)
-def identity(tensor: torch.Tensor) -> torch.Tensor:
-    _require_cuda()
-    return tensor
-
-
 if __name__ == "__main__":
     x = torch.ones(1, 4, device="cuda")
     result = load_model(hidden_size=4)
@@ -38,8 +32,5 @@ if __name__ == "__main__":
             y = handle.value(x)
     else:
         y = result(x)
-    echoed = identity(x)
 
     print("y=", y)
-    print("echoed_device=", echoed.device)
-    print("echoed=", echoed)

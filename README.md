@@ -102,11 +102,6 @@ def load_model(hidden_size: int = 4) -> torch.nn.Module:
     return torch.nn.Linear(hidden_size, 2, device="cuda")
 
 
-@provider.share(cache=False)
-def identity(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor
-
-
 if __name__ == "__main__":
     x = torch.ones(1, 4, device="cuda")
     maybe_handle = load_model(hidden_size=4)
@@ -115,8 +110,7 @@ if __name__ == "__main__":
             y = handle.value(x)
     else:
         y = maybe_handle(x)
-    echoed = identity(x)
-    print(y, echoed)
+    print(y)
 ```
 
 Run process A as the auto server:
@@ -163,8 +157,6 @@ shared fn executes locally              shared fn becomes RPC call
 
 load_model(...)                         load_model(...)
   -> local CUDA model                     -> JSON-RPC to localhost daemon
-identity(x)                              -> receives CUDA IPC-backed result
-  -> local tensor return
 ```
 
 Use this mode when you want the cleanest operator experience: one script, one env var difference, server side stays local, client side becomes remote automatically.
