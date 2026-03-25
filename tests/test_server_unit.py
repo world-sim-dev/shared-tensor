@@ -179,9 +179,23 @@ def test_server_serialize_error_includes_type() -> None:
 
 def test_server_resolve_process_start_method_prefers_fork_without_main_file(monkeypatch: pytest.MonkeyPatch) -> None:
     server = SharedTensorServer(SharedTensorProvider(execution_mode="server"))
+
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+        @staticmethod
+        def is_initialized() -> bool:
+            return False
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
     monkeypatch.setattr("shared_tensor.server.os.name", "posix")
     monkeypatch.setattr("shared_tensor.server.mp.get_all_start_methods", lambda: ["fork", "spawn"])
     monkeypatch.delattr("__main__.__file__", raising=False)
+    monkeypatch.setitem(__import__("sys").modules, "torch", FakeTorch())
 
     assert server._resolve_process_start_method() == "fork"
 
