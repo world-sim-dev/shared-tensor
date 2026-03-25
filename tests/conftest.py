@@ -21,15 +21,20 @@ def running_server() -> Iterator:
         provider.base_path = base_path
         server = SharedTensorServer(provider, **kwargs)
         server.start(blocking=False)
-        deadline = time.time() + 5
+        deadline = time.time() + 30
         while time.time() < deadline:
+            process = server.server_process
+            if process is not None and not process.is_alive() and process.exitcode is not None:
+                raise RuntimeError(
+                    f"shared_tensor server exited before becoming ready: exitcode={process.exitcode}"
+                )
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                     sock.settimeout(0.2)
                     sock.connect(server.socket_path)
                 break
             except OSError:
-                time.sleep(0.01)
+                time.sleep(0.05)
         else:
             raise TimeoutError(f"Timed out waiting for server socket {server.socket_path}")
         servers.append((server, base_dir))
