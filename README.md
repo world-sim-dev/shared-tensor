@@ -161,32 +161,7 @@ load_model(...)                         load_model(...)
 
 Use this mode when you want the cleanest operator experience: one script, one env var difference, server side stays local, client side becomes remote automatically.
 
-## Example 2: Fast Tensor Transform
-
-See [examples/model_service.py](./examples/model_service.py).
-
-```python
-@provider.share(execution="direct", cache=False)
-def scale_tensor(tensor: torch.Tensor, factor: torch.Tensor) -> torch.Tensor:
-    return tensor * factor
-```
-
-What happens on the wire:
-
-```text
-client tensor -> direct RPC -> server runs function immediately -> CUDA result back
-```
-
-Use this for cheap tensor math, lightweight preprocessing, and request-scoped outputs.
-
-Recommended combination:
-
-- `execution="direct"`
-- `cache=False`
-- `managed=False`
-- `concurrency="parallel"`
-
-## Example 3: Reusable Model Service
+## Example 2: Reusable Model Service
 
 See [examples/model_service.py](./examples/model_service.py).
 
@@ -217,6 +192,8 @@ release(obj-123) ------------------------------------------> refcount 1 -> 0 -> 
 
 Use this for big reusable models. The important mix is:
 
+Recommended combination:
+
 - `execution="task"`
 - `managed=True`
 - `concurrency="serialized"`
@@ -225,7 +202,7 @@ Use this for big reusable models. The important mix is:
 
 `managed=True` gives explicit lifecycle control. `cache_format_key` turns the endpoint into a model registry. `singleflight=True` ensures duplicate in-flight loads collapse to one build.
 
-## Example 4: Fire-And-Poll Warmup
+## Example 3: Fire-And-Poll Warmup
 
 This is the same task-backed endpoint style, but the caller chooses async use:
 
@@ -242,7 +219,7 @@ submit now -> task queue -> slow build on server -> poll later -> consume handle
 
 Use this when the build is slow enough that the caller should not block immediately.
 
-## Example 5: Serialized Fragile Path
+## Example 4: Serialized Fragile Path
 
 ```python
 @provider.share(execution="task", concurrency="serialized", cache=False, singleflight=False)
@@ -258,6 +235,41 @@ request B -> wait -> lock -> run -> unlock
 ```
 
 Use this for GPU-heavy paths that must not overlap with themselves.
+
+## Example 5: Direct Tensor Path
+
+See [examples/model_service.py](./examples/model_service.py).
+
+```python
+@provider.share(execution="direct", cache=False)
+def scale_tensor(tensor: torch.Tensor, factor: torch.Tensor) -> torch.Tensor:
+    return tensor * factor
+```
+
+What happens on the wire:
+
+```text
+client tensor -> direct RPC -> server runs function immediately -> CUDA result back
+```
+
+This is supported, but it is not the main reason this library exists. Use it only for small, request-scoped CUDA transforms that genuinely benefit from process separation.
+
+Recommended combination:
+
+- `execution="direct"`
+- `cache=False`
+- `managed=False`
+- `concurrency="parallel"`
+
+## Example 6: Release Discipline
+
+```python
+with load_model(hidden_size=8) as handle:
+    model = handle.value
+    y = model(torch.ones(1, 8, device="cuda"))
+```
+
+Use `managed=True` when the returned object is long-lived enough that you want deterministic release instead of waiting for process teardown.
 
 ## Endpoint Semantics
 
