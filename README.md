@@ -53,6 +53,88 @@ conda activate shared-tensor-dev
 pip install -e ".[dev,test]"
 ```
 
+## Mental Model
+
+### 1. Zero-Branch Auto Mode
+
+```text
+same code file
+
+Process A                               Process B
+SHARED_TENSOR_ROLE=server               SHARED_TENSOR_ROLE unset
+----------------------------------      ----------------------------------
+provider.share(...)                     provider.share(...)
+provider auto-starts localhost daemon   provider builds RPC wrappers
+shared fn executes locally              shared fn becomes client call
+
+load_model(...)                         load_model(...)
+  -> local function body                  -> JSON-RPC to localhost daemon
+  -> CUDA model on this GPU               -> receives CUDA IPC-backed object
+```
+
+### 2. Direct Endpoint
+
+```text
+Client process                Server process
+------------------------      ------------------------------
+call("scale_tensor", x) ---> decode args
+                              run function immediately
+                              encode CUDA result
+<-------------------------     return result
+
+Best for: fast tensor transforms
+Key property: no task lifecycle
+```
+
+### 3. Task Endpoint For Slow Construction
+
+```text
+Client process                Server process
+------------------------      ----------------------------------------
+submit("load_model") ----->  create task record
+                              run slow model load in task executor
+poll / wait_for_task(...)     keep task status/result
+<-------------------------     return final CUDA object or handle
+
+Best for: slow model init, warmup, large allocations
+Key property: sync call can still block on task completion, async submit is also available
+```
+
+### 4. Managed + Cache + Singleflight
+
+```text
+Client A                      Server                         Client B
+------------------------      ------------------------       ------------------------
+call("load_model", k) -----> cache miss                    call("load_model", k)
+                              build object once              -------------> same key in flight
+                              object_id = obj-123                         wait on same future
+<-------------------------     return handle(obj-123)       <------------- return handle(obj-123)
+
+release(obj-123) ---------->  refcount 2 -> 1
+release(obj-123) ------------------------------------------> refcount 1 -> 0 -> destroy
+
+Best for: reusable models
+Key property: one build, many handles, explicit release
+```
+
+### 5. Serialized Endpoint
+
+```text
+Request 1                     Server lock                    Request 2
+------------------------      ------------------------       ------------------------
+call("compact_memory") --->  acquire endpoint lock
+                              run endpoint
+                              release lock
+<-------------------------                                   waits
+                                                             acquire lock
+                                                             run endpoint
+                                                             release lock
+                                   <------------------------- return
+
+Best for: fragile GPU-heavy paths that must not overlap
+Key property: serialization is endpoint-wide, not just per cache key
+```
+
 ## Zero-Branch Example
 
 One file:
@@ -138,6 +220,10 @@ Endpoint options:
 
 ### 1. Fast Tensor Transform
 
+```text
+client tensor -> direct RPC -> server op -> CUDA result back
+```
+
 Use this for cheap operations such as clone, view-like transforms, elementwise scaling, or lightweight preprocessing.
 
 ```python
@@ -160,6 +246,10 @@ Why:
 - parallel execution is usually fine because the work is short-lived
 
 ### 2. Slow Model Construction
+
+```text
+client call/submit -> task queue -> slow load/build on server -> managed handle/result
+```
 
 Use this for loading or building a CUDA model that may take hundreds of milliseconds or multiple seconds.
 
@@ -191,6 +281,10 @@ Why:
 
 ### 3. Reusable Shared Model Service
 
+```text
+many clients -> same cache key -> same cached object_id -> refcounted release
+```
+
 Use this when the model should be built once and reused by many client calls.
 
 ```python
@@ -218,6 +312,10 @@ Why:
 
 ### 4. Fire-and-Poll Background Warmup
 
+```text
+submit now -> task runs in background -> poll later -> consume handle/result
+```
+
 Use this when the caller should not block, for example prewarming a model or allocating a large reusable tensor in the background.
 
 ```python
@@ -237,6 +335,12 @@ Why:
 - the caller decides whether to block now or poll later
 
 ### 5. Strictly Non-Reusable Per-Request Work
+
+```text
+request A -> fresh object
+request B -> fresh object
+no cache, no reuse, no singleflight
+```
 
 Use this when every request must create a fresh result and reuse is wrong.
 
@@ -258,6 +362,11 @@ Why:
 - disabling singleflight ensures independent requests stay independent
 
 ### 6. Endpoint That Must Run One At A Time
+
+```text
+request A -> lock -> run -> unlock
+request B -> wait -> lock -> run -> unlock
+```
 
 Use this when the endpoint mutates shared state, temporarily spikes memory, or must not overlap with itself.
 
