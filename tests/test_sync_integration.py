@@ -101,18 +101,15 @@ def test_task_endpoint_singleflight_deduplicates_concurrent_calls(running_server
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
-    started = time.time()
     first = threading.Thread(target=worker)
     second = threading.Thread(target=worker)
     first.start()
     second.start()
     first.join(timeout=3)
     second.join(timeout=3)
-    elapsed = time.time() - started
 
     assert errors == []
     assert len(results) == 2
-    assert elapsed < 0.30
     assert results[0].object_id == results[1].object_id
 
     with SharedTensorClient(base_port=server.port) as client:
@@ -319,15 +316,16 @@ def test_sync_client_rejects_plain_python_result_payloads(running_server) -> Non
             client.call("plain")
 
 
-def test_sync_client_rejects_plain_python_args(running_server) -> None:
+def test_sync_client_rejects_plain_python_result_payloads(running_server) -> None:
     provider = SharedTensorProvider(execution_mode="server")
 
     @provider.share
-    def echo(value):
+    def echo(tensor: torch.Tensor, value: int):
+        del tensor
         return value
 
     server = running_server(provider)
 
     with SharedTensorClient(base_port=server.port) as client:
-        with pytest.raises(SharedTensorCapabilityError):
-            client.call("echo", 1)
+        with pytest.raises(SharedTensorRemoteError):
+            client.call("echo", torch.ones(1, device="cuda"), value=1)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import multiprocessing.reduction as mp_reduction
 
 import pytest
 
@@ -9,6 +10,7 @@ from shared_tensor.utils import (
     CONTROL_ENCODING,
     SHARED_TENSOR_BASE_PORT_ENV,
     TORCH_ENCODING,
+    _validate_call_payload,
     build_cache_key,
     deserialize_payload,
     format_cache_key,
@@ -55,6 +57,7 @@ def test_serialize_call_payloads_empty_uses_control_encoding() -> None:
     assert deserialize_payload(encoding, kwargs_payload) == {}
 
 
+
 def test_cache_key_is_stable_for_equivalent_inputs() -> None:
     left = build_cache_key("sum", (1, 2), {"scale": 3})
     right = build_cache_key("sum", (1, 2), {"scale": 3})
@@ -85,6 +88,21 @@ def test_resolve_server_base_port_uses_new_env_name(monkeypatch: pytest.MonkeyPa
 def test_resolve_runtime_port_offsets_base_port(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("shared_tensor.utils.resolve_device_index", lambda device_index=None: 4)
     assert resolve_runtime_port(3000) == 3004
+
+
+def test_torch_forking_pickler_falls_back_to_stdlib(monkeypatch: pytest.MonkeyPatch) -> None:
+    reductions = torch.multiprocessing.reductions
+    monkeypatch.delattr(reductions, "ForkingPickler", raising=False)
+    from shared_tensor.utils import _torch_forking_pickler
+
+    assert _torch_forking_pickler() is mp_reduction.ForkingPickler
+
+
+def test_validate_call_payload_allows_scalar_kwargs_with_cuda_tensors() -> None:
+    payload = {"tensor": torch.ones(1, device="cuda") if torch.cuda.is_available() else None, "version": 3}
+    if payload["tensor"] is None:
+        pytest.skip("CUDA is not available")
+    _validate_call_payload(payload, allow_dict_keys=True)
 
 
 def _produce_cuda_payload(kind: str, payload_queue, release_queue) -> None:

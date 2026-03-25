@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import io
+import multiprocessing.reduction as mp_reduction
 import os
 import pickle
 from collections.abc import Callable
@@ -35,7 +36,14 @@ _EMPTY_DICT: dict[str, Any] = {}
 def _torch_forking_pickler() -> type | None:
     if TORCH_MODULE is None:
         return None
-    return cast(type, TORCH_MODULE.multiprocessing.reductions.ForkingPickler)
+    reductions = TORCH_MODULE.multiprocessing.reductions
+    init_reductions = getattr(reductions, "init_reductions", None)
+    if callable(init_reductions):
+        init_reductions()
+    pickler = getattr(reductions, "ForkingPickler", None)
+    if pickler is not None:
+        return cast(type, pickler)
+    return cast(type, mp_reduction.ForkingPickler)
 
 
 def _raise_unsupported_payload(message: str) -> None:
@@ -91,9 +99,53 @@ def _validate_torch_payload(obj: Any, *, allow_dict_keys: bool = False) -> None:
     _raise_unsupported_payload(f"Unsupported payload type: {type(obj).__name__}")
 
 
+def _validate_call_payload(obj: Any, *, allow_dict_keys: bool = False) -> None:
+    if TORCH_MODULE is None:
+        raise SharedTensorCapabilityError("PyTorch is required for shared_tensor")
+
+    if isinstance(obj, (str, int, float, bool, type(None), bytes)):
+        return
+
+    if isinstance(obj, TORCH_MODULE.Tensor):
+        if not obj.is_cuda:
+            _raise_unsupported_payload("CPU torch.Tensor payloads are not supported")
+        return
+
+    if isinstance(obj, TORCH_MODULE.nn.Module):
+        _validate_module_device(obj)
+        return
+
+    if isinstance(obj, tuple):
+        for item in obj:
+            _validate_call_payload(item)
+        return
+
+    if isinstance(obj, list):
+        for item in obj:
+            _validate_call_payload(item)
+        return
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if allow_dict_keys:
+                if not isinstance(key, str):
+                    _raise_unsupported_payload("Dictionary payload keys must be strings")
+            else:
+                _validate_call_payload(key)
+            _validate_call_payload(value)
+        return
+
+    _raise_unsupported_payload(f"Unsupported payload type: {type(obj).__name__}")
+
+
 def validate_payload_for_transport(obj: Any, *, allow_dict_keys: bool = False) -> None:
     """Validate that a payload fits the supported CUDA torch transport contract."""
     _validate_torch_payload(obj, allow_dict_keys=allow_dict_keys)
+
+
+def validate_call_payload_for_transport(obj: Any, *, allow_dict_keys: bool = False) -> None:
+    """Validate RPC call args/kwargs, allowing scalar controls alongside CUDA payloads."""
+    _validate_call_payload(obj, allow_dict_keys=allow_dict_keys)
 
 
 def _torch_serialize(obj: Any) -> bytes:
@@ -140,8 +192,8 @@ def serialize_call_payloads(
         return CONTROL_ENCODING, args_payload, serialize_empty_payload(_EMPTY_DICT)[1]
 
     try:
-        _validate_torch_payload(args)
-        _validate_torch_payload(kwargs, allow_dict_keys=True)
+        _validate_call_payload(args)
+        _validate_call_payload(kwargs, allow_dict_keys=True)
         return TORCH_ENCODING, pickle.dumps(args, protocol=pickle.HIGHEST_PROTOCOL), pickle.dumps(
             kwargs, protocol=pickle.HIGHEST_PROTOCOL
         )

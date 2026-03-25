@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import cloudpickle
 import multiprocessing as mp
 import os
 import threading
@@ -10,7 +11,6 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from multiprocessing.process import BaseProcess
 from socketserver import ThreadingMixIn
 from typing import Any
 
@@ -37,7 +37,7 @@ from shared_tensor.utils import (
     capability_snapshot,
     deserialize_payload,
     serialize_payload,
-    validate_payload_for_transport,
+    validate_call_payload_for_transport,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,7 +118,7 @@ class SharedTensorServer:
         self.max_workers = max_workers
         self.result_ttl = result_ttl
         self.server: ThreadedHTTPServer | None = None
-        self.server_process: BaseProcess | None = None
+        self.server_process: Any | None = None
         self.running = False
         self.started_at: float | None = None
         self.stats = {
@@ -231,6 +231,12 @@ class SharedTensorServer:
         if inflight_key is not None:
             future, owner = self._acquire_inflight(inflight_key)
             if not owner:
+                if definition.managed:
+                    payload = future.result()
+                    object_id = payload.get("object_id")
+                    if object_id is not None:
+                        self._managed_objects.add_ref(object_id)
+                    return payload
                 return future.result()
         else:
             future = None
@@ -401,8 +407,8 @@ class SharedTensorServer:
                     "Control encoding is reserved for empty args/kwargs only"
                 )
             return endpoint, args, kwargs
-        validate_payload_for_transport(args)
-        validate_payload_for_transport(kwargs, allow_dict_keys=True)
+        validate_call_payload_for_transport(args)
+        validate_call_payload_for_transport(kwargs, allow_dict_keys=True)
         return endpoint, args, kwargs
 
     def _encode_result(self, value: Any, *, object_id: str | None = None) -> dict[str, str | None]:
@@ -454,16 +460,52 @@ class SharedTensorServer:
             return
         if os.name != "posix":
             raise SharedTensorConfigurationError(
-                "Non-blocking shared_tensor servers require POSIX fork semantics"
+                "Non-blocking shared_tensor servers require POSIX multiprocessing support"
             )
-        ctx = mp.get_context("fork")
-        process = ctx.Process(target=self._serve_forever, name=f"shared-tensor-daemon:{self.port}")
+        payload = cloudpickle.dumps(self.provider)
+        process = mp.get_context("spawn").Process(
+            target=self._serve_forever_from_payload,
+            args=(
+                payload,
+                self.host,
+                self.port,
+                self.max_request_bytes,
+                self.max_workers,
+                self.result_ttl,
+                self.verbose_debug,
+            ),
+            name=f"shared-tensor-daemon:{self.port}",
+        )
         process.start()
         self.server_process = process
         self.running = True
         self.started_at = time.time()
 
+    @staticmethod
+    def _serve_forever_from_payload(
+        payload: bytes,
+        host: str,
+        port: int,
+        max_request_bytes: int,
+        max_workers: int,
+        result_ttl: float,
+        verbose_debug: bool,
+    ) -> None:
+        SharedTensorServer._configure_cuda_runtime()
+        provider = cloudpickle.loads(payload)
+        server = SharedTensorServer(
+            provider,
+            host=host,
+            port=port,
+            max_request_bytes=max_request_bytes,
+            max_workers=max_workers,
+            result_ttl=result_ttl,
+            verbose_debug=verbose_debug,
+        )
+        server._serve_forever()
+
     def _serve_forever(self) -> None:
+        self._configure_cuda_runtime()
         self.server = ThreadedHTTPServer((self.host, self.port), SharedTensorRequestHandler)
         self.server.shared_tensor_server = self  # type: ignore[attr-defined]
         self.running = True
