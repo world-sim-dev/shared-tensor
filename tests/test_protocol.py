@@ -1,107 +1,51 @@
 from __future__ import annotations
 
+import socket
+
 import pytest
 
-from shared_tensor.errors import SharedTensorProtocolError
-from shared_tensor.jsonrpc import (
-    JsonRpcRequest,
-    JsonRpcResponse,
-    create_error_response,
-    create_success_response,
-    parse_request,
-    parse_response,
-)
+from shared_tensor.errors import SharedTensorClientError, SharedTensorProtocolError
+from shared_tensor.transport import decode_message, encode_message, recv_message, send_message
 
 
-def test_jsonrpc_request_round_trip() -> None:
-    request = JsonRpcRequest(method="ping", params={"value": 1})
-    parsed = parse_request(request.to_json())
-    assert parsed.method == "ping"
-    assert parsed.params == {"value": 1}
+def test_transport_message_round_trip() -> None:
+    payload = {"method": "ping", "params": {"value": 1}}
+    encoded = encode_message(payload)
+    assert decode_message(encoded[4:]) == payload
 
 
-def test_jsonrpc_response_round_trip() -> None:
-    response = JsonRpcResponse(id="abc", result={"ok": True})
-    parsed = parse_response(response.to_json())
-    assert parsed.id == "abc"
-    assert parsed.result == {"ok": True}
+def test_transport_send_and_receive_over_socketpair() -> None:
+    left, right = socket.socketpair()
+    try:
+        send_message(left, {"ok": True, "result": {"value": 1}})
+        assert recv_message(right) == {"ok": True, "result": {"value": 1}}
+    finally:
+        left.close()
+        right.close()
 
 
-def test_jsonrpc_request_generates_id_and_omits_none_params() -> None:
-    request = JsonRpcRequest(method="ping")
-
-    payload = request.to_dict()
-
-    assert isinstance(request.id, str)
-    assert "params" not in payload
+def test_decode_message_rejects_invalid_pickle() -> None:
+    with pytest.raises(SharedTensorProtocolError, match="Failed to decode transport message"):
+        decode_message(b"not-a-pickle")
 
 
-def test_jsonrpc_response_to_dict_prefers_error_shape() -> None:
-    response = JsonRpcResponse(id="abc", error={"code": -1, "message": "boom"})
-
-    payload = response.to_dict()
-
-    assert payload == {
-        "id": "abc",
-        "error": {"code": -1, "message": "boom"},
-        "jsonrpc": "2.0",
-    }
-
-
-def test_create_response_helpers() -> None:
-    assert create_success_response("1", {"ok": True}).to_dict()["result"] == {"ok": True}
-    assert create_error_response("1", -1, "boom", data={"x": 1}).to_dict()["error"] == {
-        "code": -1,
-        "message": "boom",
-        "data": {"x": 1},
-    }
+def test_recv_message_rejects_zero_length_frame() -> None:
+    left, right = socket.socketpair()
+    try:
+        left.sendall(bytes.fromhex("00000000"))
+        with pytest.raises(SharedTensorProtocolError, match="must be positive"):
+            recv_message(right)
+    finally:
+        left.close()
+        right.close()
 
 
-def test_parse_request_rejects_invalid_version() -> None:
-    with pytest.raises(SharedTensorProtocolError):
-        parse_request('{"jsonrpc": "1.0", "method": "ping", "id": 1}')
-
-
-def test_parse_request_rejects_invalid_json() -> None:
-    with pytest.raises(SharedTensorProtocolError, match="Invalid JSON"):
-        parse_request("{")
-
-
-def test_parse_request_rejects_non_object_payload() -> None:
-    with pytest.raises(SharedTensorProtocolError, match="JSON object"):
-        parse_request('[]')
-
-
-def test_parse_request_rejects_missing_method() -> None:
-    with pytest.raises(SharedTensorProtocolError, match="Missing required field 'method'"):
-        parse_request('{"jsonrpc": "2.0", "id": 1}')
-
-
-def test_parse_request_rejects_non_object_params() -> None:
-    with pytest.raises(SharedTensorProtocolError, match="'params' must be an object"):
-        parse_request('{"jsonrpc": "2.0", "method": "ping", "params": []}')
-
-
-def test_parse_response_requires_result_or_error() -> None:
-    with pytest.raises(SharedTensorProtocolError):
-        parse_response('{"jsonrpc": "2.0", "id": 1}')
-
-
-def test_parse_response_rejects_invalid_json() -> None:
-    with pytest.raises(SharedTensorProtocolError, match="Invalid JSON"):
-        parse_response("{")
-
-
-def test_parse_response_rejects_non_object_payload() -> None:
-    with pytest.raises(SharedTensorProtocolError, match="JSON object"):
-        parse_response('[]')
-
-
-def test_parse_response_rejects_missing_id() -> None:
-    with pytest.raises(SharedTensorProtocolError, match="Missing required field 'id'"):
-        parse_response('{"jsonrpc": "2.0", "result": {}}')
-
-
-def test_parse_response_rejects_both_result_and_error() -> None:
-    with pytest.raises(SharedTensorProtocolError, match="exactly one"):
-        parse_response('{"jsonrpc": "2.0", "id": 1, "result": {}, "error": {}}')
+def test_recv_message_rejects_closed_connection_mid_frame() -> None:
+    left, right = socket.socketpair()
+    try:
+        left.sendall(bytes.fromhex("000000056162"))
+        left.close()
+        with pytest.raises(SharedTensorClientError, match="Connection closed"):
+            recv_message(right)
+    finally:
+        right.close()

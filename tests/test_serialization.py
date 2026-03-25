@@ -5,21 +5,20 @@ import multiprocessing.reduction as mp_reduction
 
 import pytest
 
-from shared_tensor.errors import SharedTensorCapabilityError
-from shared_tensor.errors import SharedTensorConfigurationError
+from shared_tensor.errors import SharedTensorCapabilityError, SharedTensorConfigurationError
 from shared_tensor.utils import (
     CONTROL_ENCODING,
-    SHARED_TENSOR_BASE_PORT_ENV,
+    SHARED_TENSOR_BASE_PATH_ENV,
     TORCH_ENCODING,
-    _validate_call_payload,
     _normalize_for_cache,
+    _validate_call_payload,
     build_cache_key,
     deserialize_payload,
     format_cache_key,
     payload_uses_cuda,
     resolve_device_index,
-    resolve_runtime_port,
-    resolve_server_base_port,
+    resolve_runtime_socket_path,
+    resolve_server_base_path,
     serialize_call_payloads,
     serialize_empty_payload,
     serialize_payload,
@@ -63,7 +62,6 @@ def test_serialize_call_payloads_empty_uses_control_encoding() -> None:
     assert deserialize_payload(encoding, kwargs_payload) == {}
 
 
-
 def test_cache_key_is_stable_for_equivalent_inputs() -> None:
     left = build_cache_key("sum", (1, 2), {"scale": 3})
     right = build_cache_key("sum", (1, 2), {"scale": 3})
@@ -86,20 +84,14 @@ def test_format_cache_key_defaults_from_function_signature() -> None:
     assert format_cache_key(op, (1,), {}, "{scale}") == "7"
 
 
-def test_resolve_server_base_port_uses_new_env_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(SHARED_TENSOR_BASE_PORT_ENV, "4567")
-    assert resolve_server_base_port(2537) == 4567
+def test_resolve_server_base_path_uses_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(SHARED_TENSOR_BASE_PATH_ENV, "/tmp/shared-tensor-test")
+    assert resolve_server_base_path("/tmp/default") == "/tmp/shared-tensor-test"
 
 
-def test_resolve_server_base_port_rejects_invalid_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(SHARED_TENSOR_BASE_PORT_ENV, "bad")
-    with pytest.raises(SharedTensorConfigurationError, match="must be an integer"):
-        resolve_server_base_port(2537)
-
-
-def test_resolve_runtime_port_offsets_base_port(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_runtime_socket_path_offsets_device_index(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("shared_tensor.utils.resolve_device_index", lambda device_index=None: 4)
-    assert resolve_runtime_port(3000) == 3004
+    assert resolve_runtime_socket_path("/tmp/shared-tensor") == "/tmp/shared-tensor-4.sock"
 
 
 def test_resolve_device_index_rejects_negative_value() -> None:
@@ -176,7 +168,7 @@ def _produce_cuda_payload(kind: str, payload_queue, release_queue) -> None:
     else:  # pragma: no cover - defensive
         raise AssertionError(f"Unknown kind: {kind}")
     encoding, payload = serialize_payload(obj)
-    payload_queue.put((encoding, payload.hex(), expected))
+    payload_queue.put((encoding, payload, expected))
     release_queue.get(timeout=10)
 
 
@@ -187,8 +179,8 @@ def _round_trip_cuda_payload(kind: str):
     process = ctx.Process(target=_produce_cuda_payload, args=(kind, payload_queue, release_queue))
     process.start()
     try:
-        encoding, payload_hex, expected = payload_queue.get(timeout=10)
-        result = deserialize_payload(encoding, payload_hex)
+        encoding, payload, expected = payload_queue.get(timeout=10)
+        result = deserialize_payload(encoding, payload)
     finally:
         release_queue.put(True)
         process.join(timeout=10)

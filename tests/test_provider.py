@@ -73,7 +73,7 @@ def test_server_mode_returns_original_function() -> None:
     assert inc(3) == 4
 
 
-def test_client_mode_wrapper_calls_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_client_mode_wrapper_calls_endpoint() -> None:
     provider = SharedTensorProvider(execution_mode="client")
 
     calls = []
@@ -96,7 +96,7 @@ def test_client_mode_wrapper_calls_endpoint(monkeypatch: pytest.MonkeyPatch) -> 
     assert calls == [("wrapped", (3,), {})]
 
 
-def test_client_mode_wrapper_exposes_submit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_client_mode_wrapper_exposes_submit() -> None:
     provider = SharedTensorProvider(execution_mode="client")
 
     calls = []
@@ -139,7 +139,11 @@ def test_provider_execute_wait_false_returns_task_id(monkeypatch: pytest.MonkeyP
 def test_provider_execute_wait_true_uses_wait_for_task(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = SharedTensorProvider(execution_mode="client")
     monkeypatch.setattr(provider, "submit", lambda endpoint, *args, **kwargs: "task-1")
-    monkeypatch.setattr(provider, "wait_for_task", lambda task_id, timeout=None, callback=None: (task_id, timeout, callback))
+    monkeypatch.setattr(
+        provider,
+        "wait_for_task",
+        lambda task_id, timeout=None, callback=None: (task_id, timeout, callback),
+    )
 
     assert provider.execute("load", wait=True, timeout=2) == ("task-1", 2, None)
 
@@ -249,23 +253,22 @@ def test_auto_mode_provider_enabled_false_overrides_enabled_env(
 def test_env_server_role_autostarts_and_restarts_server(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
     monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
-    monkeypatch.setenv("SHARED_TENSOR_BASE_PORT", "34567")
+    monkeypatch.setenv("SHARED_TENSOR_BASE_PATH", "/tmp/shared-tensor-provider")
 
-    events: list[tuple[str, int]] = []
+    events: list[tuple[str, str]] = []
 
     class FakeServer:
-        def __init__(self, provider, *, host, port, verbose_debug=False):
+        def __init__(self, provider, *, socket_path, verbose_debug=False):
             assert provider.execution_mode == "server"
-            assert host == "127.0.0.1"
-            assert port == 34567
-            self.port = port
+            assert socket_path == "/tmp/shared-tensor-provider-0.sock"
+            self.socket_path = socket_path
 
         def start(self, blocking=False):
             assert blocking is False
-            events.append(("start", self.port))
+            events.append(("start", self.socket_path))
 
         def stop(self):
-            events.append(("stop", self.port))
+            events.append(("stop", self.socket_path))
 
     monkeypatch.setattr("shared_tensor.server.SharedTensorServer", FakeServer)
 
@@ -282,21 +285,25 @@ def test_env_server_role_autostarts_and_restarts_server(monkeypatch: pytest.Monk
     assert provider.execution_mode == "server"
     assert first() == "first"
     assert second() == "second"
-    assert events == [("start", 34567), ("stop", 34567), ("start", 34567)]
+    assert events == [
+        ("start", "/tmp/shared-tensor-provider-0.sock"),
+        ("stop", "/tmp/shared-tensor-provider-0.sock"),
+        ("start", "/tmp/shared-tensor-provider-0.sock"),
+    ]
 
     provider.close()
-    assert events == [("start", 34567), ("stop", 34567), ("start", 34567), ("stop", 34567)]
+    assert events[-1] == ("stop", "/tmp/shared-tensor-provider-0.sock")
 
 
-def test_provider_defers_port_resolution_until_client_creation(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = SharedTensorProvider(execution_mode="client", base_port=2500)
+def test_provider_defers_client_construction_until_first_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SharedTensorProvider(execution_mode="client", base_path="/tmp/shared-tensor-client")
 
-    calls: list[tuple[int, int | None]] = []
+    calls: list[tuple[str, int | None]] = []
 
     class FakeClient:
-        def __init__(self, *, base_port, host, device_index, timeout, verbose_debug):
-            del host, timeout, verbose_debug
-            calls.append((base_port, device_index))
+        def __init__(self, *, base_path, device_index, timeout, verbose_debug):
+            del timeout, verbose_debug
+            calls.append((base_path, device_index))
 
         def close(self):
             return None
@@ -312,19 +319,22 @@ def test_provider_defers_port_resolution_until_client_creation(monkeypatch: pyte
 
     assert calls == []
     assert load_model() == ("load_model", (), {})
-    assert calls == [(2500, None)]
+    assert calls == [("/tmp/shared-tensor-client", None)]
 
 
-def test_provider_accepts_explicit_device_index_for_port_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_provider_accepts_explicit_device_index_for_socket_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
     monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
+    monkeypatch.setenv("SHARED_TENSOR_BASE_PATH", "/tmp/shared-tensor-device")
 
-    observed_ports: list[int] = []
+    observed_paths: list[str] = []
 
     class FakeServer:
-        def __init__(self, provider, *, host, port, verbose_debug=False):
-            del provider, host, verbose_debug
-            observed_ports.append(port)
+        def __init__(self, provider, *, socket_path, verbose_debug=False):
+            del provider, verbose_debug
+            observed_paths.append(socket_path)
 
         def start(self, blocking=False):
             assert blocking is False
@@ -334,13 +344,13 @@ def test_provider_accepts_explicit_device_index_for_port_resolution(monkeypatch:
 
     monkeypatch.setattr("shared_tensor.server.SharedTensorServer", FakeServer)
 
-    provider = SharedTensorProvider(base_port=3000, device_index=3)
+    provider = SharedTensorProvider(device_index=3)
 
     @provider.share
     def build() -> None:
         return None
 
-    assert observed_ports == [3003]
+    assert observed_paths == ["/tmp/shared-tensor-device-3.sock"]
 
 
 def test_provider_local_cache_reuses_result_by_default_for_same_call() -> None:

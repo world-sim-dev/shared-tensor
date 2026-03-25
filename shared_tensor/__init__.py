@@ -1,4 +1,4 @@
-"""shared_tensor: local endpoint-oriented RPC for Python and PyTorch."""
+"""shared_tensor: same-host same-GPU PyTorch CUDA IPC over local UDS RPC."""
 
 from shared_tensor.async_client import AsyncSharedTensorClient
 from shared_tensor.async_provider import AsyncSharedTensorProvider

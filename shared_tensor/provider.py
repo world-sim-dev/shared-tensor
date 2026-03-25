@@ -15,8 +15,8 @@ from shared_tensor.errors import (
 )
 from shared_tensor.utils import (
     build_cache_key,
-    resolve_runtime_port,
-    resolve_server_base_port,
+    resolve_runtime_socket_path,
+    resolve_server_base_path,
 )
 
 EndpointExecution = Literal["direct", "task"]
@@ -83,10 +83,9 @@ class SharedTensorProvider:
 
     def __init__(
         self,
-        base_port: int = 2537,
+        base_path: str = "/tmp/shared-tensor",
         *,
         enabled: bool | None = None,
-        server_host: str = "127.0.0.1",
         device_index: int | None = None,
         timeout: float = 30.0,
         execution_mode: str = "auto",
@@ -96,8 +95,7 @@ class SharedTensorProvider:
             execution_mode,
             enabled=enabled,
         )
-        self.server_host = server_host
-        self.base_port = resolve_server_base_port(base_port)
+        self.base_path = resolve_server_base_path(base_path)
         self.enabled = enabled
         self.device_index = device_index
         self.timeout = timeout
@@ -296,8 +294,7 @@ class SharedTensorProvider:
             from shared_tensor.client import SharedTensorClient
 
             self._client = SharedTensorClient(
-                base_port=self.base_port,
-                host=self.server_host,
+                base_path=self.base_path,
                 device_index=self.device_index,
                 timeout=self.timeout,
                 verbose_debug=self.verbose_debug,
@@ -309,8 +306,7 @@ class SharedTensorProvider:
             from shared_tensor.async_client import AsyncSharedTensorClient
 
             self._async_client = AsyncSharedTensorClient(
-                base_port=self.base_port,
-                host=self.server_host,
+                base_path=self.base_path,
                 device_index=self.device_index,
                 timeout=self.timeout,
                 verbose_debug=self.verbose_debug,
@@ -327,8 +323,7 @@ class SharedTensorProvider:
             self._server.stop()
         self._server = SharedTensorServer(
             self,
-            host=self.server_host,
-            port=resolve_runtime_port(self.base_port, self.device_index),
+            socket_path=resolve_runtime_socket_path(self.base_path, self.device_index),
             verbose_debug=self.verbose_debug,
         )
         self._server.start(blocking=False)

@@ -34,7 +34,7 @@ class TaskInfo:
     started_at: float | None = None
     completed_at: float | None = None
     result_encoding: str | None = None
-    result_hex: str | None = None
+    result_payload: bytes | None = None
     error_type: str | None = None
     error_message: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -48,7 +48,7 @@ class TaskInfo:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "result_encoding": self.result_encoding,
-            "result_hex": self.result_hex,
+            "result_payload": self.result_payload,
             "error_type": self.error_type,
             "error_message": self.error_message,
             "metadata": dict(self.metadata),
@@ -145,7 +145,7 @@ class TaskManager:
                 status=TaskStatus.COMPLETED,
                 completed_at=time.time(),
                 result_encoding=None,
-                result_hex=None,
+                result_payload=None,
             )
             return
 
@@ -170,7 +170,7 @@ class TaskManager:
             status=TaskStatus.COMPLETED,
             completed_at=time.time(),
             result_encoding=payload["encoding"],
-            result_hex=payload["payload_hex"],
+            result_payload=payload["payload_bytes"],
             metadata={"object_id": payload.get("object_id")},
         )
 
@@ -179,7 +179,7 @@ class TaskManager:
         encoding, payload = serialize_payload(value)
         return {
             "encoding": encoding,
-            "payload_hex": payload.hex(),
+            "payload_bytes": payload,
             "object_id": None,
         }
 
@@ -202,16 +202,16 @@ class TaskManager:
     def result(self, task_id: str) -> Any:
         payload = self.result_payload(task_id)
         encoding = payload["encoding"]
-        payload_hex = payload["payload_hex"]
-        if encoding is None or payload_hex is None:
+        payload_bytes = payload["payload_bytes"]
+        if encoding is None or payload_bytes is None:
             return None
-        return deserialize_payload(encoding, payload_hex)
+        return deserialize_payload(encoding, payload_bytes)
 
     def wait_result_payload(
         self,
         task_id: str,
         timeout: float | None = None,
-    ) -> dict[str, str | None]:
+    ) -> dict[str, str | bytes | None]:
         self._maybe_cleanup()
         with self._lock:
             entry = self._tasks.get(task_id)
@@ -226,7 +226,7 @@ class TaskManager:
             ) from exc
         return self.result_payload(task_id)
 
-    def result_payload(self, task_id: str) -> dict[str, str | None]:
+    def result_payload(self, task_id: str) -> dict[str, str | bytes | None]:
         info = self.get(task_id)
         if info.status == TaskStatus.CANCELLED:
             raise SharedTensorTaskError(f"Task '{task_id}' was cancelled")
@@ -238,7 +238,7 @@ class TaskManager:
             )
         return {
             "encoding": info.result_encoding,
-            "payload_hex": info.result_hex,
+            "payload_bytes": info.result_payload,
             "object_id": info.metadata.get("object_id"),
         }
 

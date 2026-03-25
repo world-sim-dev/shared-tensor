@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-import requests
 
 from shared_tensor import SharedObjectHandle, SharedTensorClient
 from shared_tensor.errors import (
@@ -11,27 +10,21 @@ from shared_tensor.errors import (
 )
 from shared_tensor.utils import CONTROL_ENCODING, serialize_empty_payload
 
-torch = pytest.importorskip("torch")
-
-
-class _FakeResponse:
-    def __init__(self, *, status_code: int = 200, text: str = '{"jsonrpc": "2.0", "id": "1", "result": {}}') -> None:
-        self.status_code = status_code
-        self.text = text
+pytest.importorskip("torch")
 
 
 def test_client_decode_rpc_payload_returns_none_for_empty_result() -> None:
     client = SharedTensorClient(device_index=0)
     try:
-        assert client._decode_rpc_payload({"encoding": None, "payload_hex": None}) is None
+        assert client._decode_rpc_payload({"encoding": None, "payload_bytes": None}) is None
     finally:
         client.close()
 
 
-def test_client_decode_rpc_payload_rejects_missing_payload_hex() -> None:
+def test_client_decode_rpc_payload_rejects_missing_payload_bytes() -> None:
     client = SharedTensorClient(device_index=0)
     try:
-        with pytest.raises(SharedTensorProtocolError, match="missing 'payload_hex'"):
+        with pytest.raises(SharedTensorProtocolError, match="missing 'payload_bytes'"):
             client._decode_rpc_payload({"encoding": CONTROL_ENCODING})
     finally:
         client.close()
@@ -41,15 +34,13 @@ def test_client_decode_rpc_payload_wraps_managed_result() -> None:
     client = SharedTensorClient(device_index=0)
     try:
         _, payload = serialize_empty_payload(())
-
         result = client._decode_rpc_payload(
             {
                 "encoding": CONTROL_ENCODING,
-                "payload_hex": payload.hex(),
+                "payload_bytes": payload,
                 "object_id": "obj-123",
             }
         )
-
         assert isinstance(result, SharedObjectHandle)
         assert result.object_id == "obj-123"
         assert result.value == ()
@@ -58,64 +49,63 @@ def test_client_decode_rpc_payload_wraps_managed_result() -> None:
 
 
 def test_client_send_request_converts_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = SharedTensorClient(device_index=0)
+    client = SharedTensorClient(base_path="/tmp/shared-tensor-test", device_index=0, timeout=0.5)
     try:
-        monkeypatch.setattr(
-            client.session,
-            "post",
-            lambda *args, **kwargs: (_ for _ in ()).throw(requests.exceptions.Timeout()),
-        )
+        class FakeSocket:
+            def __enter__(self):
+                return self
 
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return None
+
+            def settimeout(self, timeout):
+                return None
+
+            def connect(self, path):
+                raise TimeoutError()
+
+        monkeypatch.setattr("socket.socket", lambda *args, **kwargs: FakeSocket())
         with pytest.raises(SharedTensorClientError, match="Timed out"):
             client._request("ping")
     finally:
         client.close()
 
 
-def test_client_send_request_converts_request_exception(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = SharedTensorClient(device_index=0)
+def test_client_send_request_converts_os_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = SharedTensorClient(base_path="/tmp/shared-tensor-test", device_index=0)
     try:
-        monkeypatch.setattr(
-            client.session,
-            "post",
-            lambda *args, **kwargs: (_ for _ in ()).throw(requests.exceptions.RequestException("boom")),
-        )
+        class FakeSocket:
+            def __enter__(self):
+                return self
 
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return None
+
+            def settimeout(self, timeout):
+                return None
+
+            def connect(self, path):
+                raise OSError("boom")
+
+        monkeypatch.setattr("socket.socket", lambda *args, **kwargs: FakeSocket())
         with pytest.raises(SharedTensorClientError, match="Failed to contact"):
             client._request("ping")
     finally:
         client.close()
 
 
-def test_client_send_request_rejects_non_200_status(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_client_send_request_surfaces_remote_error(monkeypatch: pytest.MonkeyPatch) -> None:
     client = SharedTensorClient(device_index=0)
     try:
         monkeypatch.setattr(
-            client.session,
-            "post",
-            lambda *args, **kwargs: _FakeResponse(status_code=503, text="down"),
-        )
-
-        with pytest.raises(SharedTensorClientError, match="HTTP 503"):
-            client._request("ping")
-    finally:
-        client.close()
-
-
-def test_client_send_request_surfaces_remote_error_with_data(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = SharedTensorClient(device_index=0)
-    try:
-        monkeypatch.setattr(
-            client.session,
-            "post",
-            lambda *args, **kwargs: _FakeResponse(
-                text='{"jsonrpc": "2.0", "id": "1", "error": {"code": -32005, "message": "boom", "data": "extra"}}'
+            client,
+            "_send_request",
+            lambda request: (_ for _ in ()).throw(
+                SharedTensorRemoteError("Remote error [3]: boom (extra)")
             ),
         )
-
         with pytest.raises(SharedTensorRemoteError, match="boom") as exc_info:
             client._request("ping")
-
         assert "extra" in str(exc_info.value)
     finally:
         client.close()
@@ -124,7 +114,11 @@ def test_client_send_request_surfaces_remote_error_with_data(monkeypatch: pytest
 def test_client_ping_returns_false_on_client_error(monkeypatch: pytest.MonkeyPatch) -> None:
     client = SharedTensorClient(device_index=0)
     try:
-        monkeypatch.setattr(client, "_request", lambda *args, **kwargs: (_ for _ in ()).throw(SharedTensorClientError("down")))
+        monkeypatch.setattr(
+            client,
+            "_request",
+            lambda *args, **kwargs: (_ for _ in ()).throw(SharedTensorClientError("down")),
+        )
         assert client.ping() is False
     finally:
         client.close()
@@ -133,7 +127,11 @@ def test_client_ping_returns_false_on_client_error(monkeypatch: pytest.MonkeyPat
 def test_client_ping_returns_false_on_remote_error(monkeypatch: pytest.MonkeyPatch) -> None:
     client = SharedTensorClient(device_index=0)
     try:
-        monkeypatch.setattr(client, "_request", lambda *args, **kwargs: (_ for _ in ()).throw(SharedTensorRemoteError("bad")))
+        monkeypatch.setattr(
+            client,
+            "_request",
+            lambda *args, **kwargs: (_ for _ in ()).throw(SharedTensorRemoteError("bad")),
+        )
         assert client.ping() is False
     finally:
         client.close()
@@ -149,9 +147,7 @@ def test_client_release_related_helpers_forward_results(monkeypatch: pytest.Monk
             "get_server_info": {"server": "SharedTensorServer"},
             "list_endpoints": {"load_model": {"managed": True}},
         }
-
         monkeypatch.setattr(client, "_request", lambda method, params=None: responses[method])
-
         assert client.release("a") is True
         assert client.release_many(["a", "b"]) == {"a": True, "b": False}
         assert client.get_object_info("a") == {"object_id": "a"}

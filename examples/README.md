@@ -1,13 +1,11 @@
 # Examples
 
-The examples directory shows only supported same-host CUDA torch IPC patterns.
+The examples directory only shows supported same-host CUDA torch IPC patterns.
 
-- [zero_branch_env.py](/Users/mapix/workspace/shared-tensor/examples/zero_branch_env.py): one file, two processes, `SHARED_TENSOR_ENABLED=1` + `SHARED_TENSOR_ROLE=server` auto-daemon mode with task-backed model loading
-- [basic_service.py](/Users/mapix/workspace/shared-tensor/examples/basic_service.py): minimal direct endpoint examples; transport demo rather than the main production pattern
-- [async_service.py](/Users/mapix/workspace/shared-tensor/examples/async_service.py): async task endpoints returning CUDA objects
-- [model_service.py](/Users/mapix/workspace/shared-tensor/examples/model_service.py): serialized model construction with managed handles
-
-Port selection is `base_port + cuda_device_index`. By default the base port is `2537`, or `SHARED_TENSOR_BASE_PORT` when set.
+- [zero_branch_env.py](/Users/mapix/workspace/shared-tensor/examples/zero_branch_env.py): one file, two processes, env-controlled auto mode
+- [model_service.py](/Users/mapix/workspace/shared-tensor/examples/model_service.py): cached managed model registry
+- [basic_service.py](/Users/mapix/workspace/shared-tensor/examples/basic_service.py): minimal direct endpoint examples
+- [async_service.py](/Users/mapix/workspace/shared-tensor/examples/async_service.py): task submission and wait flow
 
 Auto mode:
 
@@ -16,8 +14,10 @@ SHARED_TENSOR_ENABLED=1 SHARED_TENSOR_ROLE=server python examples/zero_branch_en
 SHARED_TENSOR_ENABLED=1 python examples/zero_branch_env.py
 ```
 
-Without `SHARED_TENSOR_ENABLED=1`, `SharedTensorProvider(enabled=None)` stays in local mode by default.
+Without `SHARED_TENSOR_ENABLED=1`, providers stay in local mode by default.
 
-You can also force the behavior per provider with `enabled=True` or `enabled=False`.
+Socket selection is device-aware:
+- base path defaults to `/tmp/shared-tensor`
+- runtime socket path is `<base_path>-<device_index>.sock`
 
-Manual mode is programmatic only. Construct `SharedTensorServer(provider, port=...)` and call `start()`.
+Manual mode is programmatic only: construct `SharedTensorServer(provider, socket_path=...)` and call `start()`.

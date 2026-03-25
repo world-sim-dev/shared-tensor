@@ -1,17 +1,16 @@
-"""HTTP JSON-RPC server for explicitly registered endpoints."""
+"""Unix domain socket server for explicitly registered endpoints."""
 
 from __future__ import annotations
 
-import logging
 import cloudpickle
+import logging
 import multiprocessing as mp
 import os
+import socket
 import threading
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
 from typing import Any
 
 from shared_tensor.async_task import TaskManager, TaskStatus
@@ -23,20 +22,17 @@ from shared_tensor.errors import (
     SharedTensorSerializationError,
     SharedTensorTaskError,
 )
-from shared_tensor.jsonrpc import (
-    JsonRpcErrorCodes,
-    create_error_response,
-    create_success_response,
-    parse_request,
-)
 from shared_tensor.managed_object import ManagedObjectRegistry
 from shared_tensor.provider import EndpointDefinition, SharedTensorProvider
+from shared_tensor.transport import recv_message, send_message
 from shared_tensor.utils import (
     CONTROL_ENCODING,
     build_cache_key,
     capability_snapshot,
     deserialize_payload,
+    resolve_runtime_socket_path,
     serialize_payload,
+    unlink_socket_path,
     validate_call_payload_for_transport,
 )
 
@@ -45,57 +41,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class _InFlightCall:
-    future: Future[dict[str, str | None]]
-
-
-class SharedTensorRequestHandler(BaseHTTPRequestHandler):
-    server_version = "shared-tensor"
-
-    def log_message(self, fmt: str, *args: Any) -> None:
-        logger.info(fmt, *args)
-
-    def do_GET(self) -> None:  # noqa: N802
-        if self.path != "/health":
-            self.send_error(404, "Not Found")
-            return
-        payload = self.server.shared_tensor_server.health_response()  # type: ignore[attr-defined]
-        body = payload.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/jsonrpc":
-            self.send_error(404, "Not Found")
-            return
-        content_type = self.headers.get("Content-Type", "")
-        if not content_type.startswith("application/json"):
-            self.send_error(400, "Content-Type must be application/json")
-            return
-        try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self.send_error(400, "Invalid Content-Length header")
-            return
-        server = self.server.shared_tensor_server  # type: ignore[attr-defined]
-        if content_length > server.max_request_bytes:
-            self.send_error(413, "Request body too large")
-            return
-        raw = self.rfile.read(content_length).decode("utf-8")
-        response = server.process_jsonrpc_request(raw)
-        body = response.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+    future: Future[dict[str, Any]]
 
 
 class SharedTensorServer:
@@ -103,21 +49,22 @@ class SharedTensorServer:
         self,
         provider: SharedTensorProvider | None = None,
         *,
-        host: str = "127.0.0.1",
-        port: int = 2537,
+        socket_path: str | None = None,
         max_request_bytes: int = 64 * 1024 * 1024,
         max_workers: int = 4,
         result_ttl: float = 3600.0,
         verbose_debug: bool = False,
     ) -> None:
         self.provider = provider or SharedTensorProvider(execution_mode="server")
-        self.host = host
-        self.port = port
+        self.socket_path = socket_path or resolve_runtime_socket_path(
+            self.provider.base_path,
+            self.provider.device_index,
+        )
         self.max_request_bytes = max_request_bytes
         self.verbose_debug = verbose_debug
         self.max_workers = max_workers
         self.result_ttl = result_ttl
-        self.server: ThreadedHTTPServer | None = None
+        self.listener: socket.socket | None = None
         self.server_process: Any | None = None
         self.running = False
         self.started_at: float | None = None
@@ -126,31 +73,32 @@ class SharedTensorServer:
             "errors_encountered": 0,
         }
         self._task_manager: TaskManager | None = None
-        self._call_executor: TaskManager | None = None
-        self._cache: dict[str, dict[str, str | None]] = {}
+        self._cache: dict[str, dict[str, Any]] = {}
         self._managed_objects = ManagedObjectRegistry()
         self._inflight: dict[str, _InFlightCall] = {}
         self._endpoint_locks: dict[str, threading.Lock] = {}
         self._coordination_lock = threading.RLock()
 
-    def health_response(self) -> str:
-        from json import dumps
-
-        return dumps({"status": "healthy", "timestamp": time.time()})
-
-    def process_jsonrpc_request(self, raw: str) -> str:
-        request_id: str | int | None = None
+    def process_request(self, request: dict[str, Any]) -> dict[str, Any]:
         try:
-            request = parse_request(raw)
-            request_id = request.id
+            method = request.get("method")
+            if not isinstance(method, str) or not method:
+                raise SharedTensorProtocolError("Missing required field 'method'")
+            params = request.get("params") or {}
+            if not isinstance(params, dict):
+                raise SharedTensorProtocolError("'params' must be an object when provided")
             self.stats["requests_processed"] += 1
-            result = self._dispatch(request.method, request.params or {})
-            return create_success_response(request_id, result).to_json()
+            return {"ok": True, "result": self._dispatch(method, params)}
         except Exception as exc:
             self.stats["errors_encountered"] += 1
             logger.exception("Failed to process request")
-            code = self._error_code_for(exc)
-            return create_error_response(request_id, code, str(exc)).to_json()
+            return {
+                "ok": False,
+                "error": {
+                    "code": self._error_code_for(exc),
+                    "message": str(exc),
+                },
+            }
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "ping":
@@ -161,18 +109,14 @@ class SharedTensorServer:
             return self.provider.list_endpoints()
         if method == "call":
             return self._handle_call(params)
-        if method == "release_object":
-            return self._handle_release_object(params)
-        if method == "release_objects":
-            return self._handle_release_objects(params)
-        if method == "get_object_info":
-            return self._handle_get_object_info(params)
         if method == "submit":
             return self._handle_submit(params)
         if method == "get_task":
             return self._task_manager_instance().get(self._require_task_id(params)).to_dict()
         if method == "get_task_result":
             return self._task_manager_instance().result_payload(self._require_task_id(params))
+        if method == "wait_task":
+            return self._wait_task(params)
         if method == "cancel_task":
             task_id = self._require_task_id(params)
             return {"task_id": task_id, "cancelled": self._task_manager_instance().cancel(task_id)}
@@ -183,9 +127,15 @@ class SharedTensorServer:
                 task_id: info.to_dict()
                 for task_id, info in self._task_manager_instance().list(status=status_enum).items()
             }
-        raise SharedTensorProtocolError(f"Unknown JSON-RPC method '{method}'")
+        if method == "release_object":
+            return self._handle_release_object(params)
+        if method == "release_objects":
+            return self._handle_release_objects(params)
+        if method == "get_object_info":
+            return self._handle_get_object_info(params)
+        raise SharedTensorProtocolError(f"Unknown RPC method '{method}'")
 
-    def _handle_call(self, params: dict[str, Any]) -> dict[str, str | None]:
+    def _handle_call(self, params: dict[str, Any]) -> dict[str, Any]:
         endpoint, args, kwargs = self._decode_call_params(params)
         definition = self.provider.get_endpoint(endpoint)
         if definition.execution == "task":
@@ -196,8 +146,21 @@ class SharedTensorServer:
     def _handle_submit(self, params: dict[str, Any]) -> dict[str, Any]:
         endpoint, args, kwargs = self._decode_call_params(params)
         definition = self.provider.get_endpoint(endpoint)
-        info = self._submit_endpoint_task(endpoint, definition, args, kwargs)
-        return info.to_dict()
+        return self._submit_endpoint_task(endpoint, definition, args, kwargs).to_dict()
+
+    def _wait_task(self, params: dict[str, Any]) -> dict[str, Any]:
+        task_id = self._require_task_id(params)
+        timeout = params.get("timeout")
+        if timeout is not None and not isinstance(timeout, (int, float)):
+            raise SharedTensorProtocolError("'timeout' must be a number when provided")
+        try:
+            self._task_manager_instance().wait_result_payload(task_id, timeout=timeout)
+        except SharedTensorTaskError:
+            info = self._task_manager_instance().get(task_id)
+            if info.status in {TaskStatus.PENDING, TaskStatus.RUNNING}:
+                return info.to_dict()
+            raise
+        return self._task_manager_instance().get(task_id).to_dict()
 
     def _submit_endpoint_task(
         self,
@@ -220,7 +183,7 @@ class SharedTensorServer:
         definition: EndpointDefinition,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> dict[str, str | None]:
+    ) -> dict[str, Any]:
         cache_key = self._cache_key(endpoint, definition, args, kwargs)
         if cache_key is not None:
             cached = self._lookup_cached_result(definition, cache_key)
@@ -261,7 +224,7 @@ class SharedTensorServer:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         cache_key: str | None,
-    ) -> dict[str, str | None]:
+    ) -> dict[str, Any]:
         if definition.concurrency == "serialized":
             lock = self._endpoint_lock(endpoint)
             with lock:
@@ -278,14 +241,13 @@ class SharedTensorServer:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         cache_key: str | None,
-    ) -> dict[str, str | None]:
+    ) -> dict[str, Any]:
         if definition.managed:
-            result = self._materialize_managed_result(endpoint, definition, args, kwargs, cache_key)
-        else:
-            value = definition.func(*args, **kwargs)
-            result = self._encode_result(value)
-            if cache_key is not None:
-                self._cache[cache_key] = result
+            return self._materialize_managed_result(endpoint, definition, args, kwargs, cache_key)
+        value = definition.func(*args, **kwargs)
+        result = self._encode_result(value)
+        if cache_key is not None:
+            self._cache[cache_key] = result
         return result
 
     def _materialize_managed_result(
@@ -295,7 +257,7 @@ class SharedTensorServer:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         cache_key: str | None,
-    ) -> dict[str, str | None]:
+    ) -> dict[str, Any]:
         if cache_key is not None:
             cached = self._managed_objects.get_cached(cache_key)
             if cached is not None:
@@ -310,7 +272,7 @@ class SharedTensorServer:
         self,
         definition: EndpointDefinition,
         cache_key: str | None,
-    ) -> dict[str, str | None] | None:
+    ) -> dict[str, Any] | None:
         if cache_key is None:
             return None
         if definition.managed:
@@ -338,16 +300,16 @@ class SharedTensorServer:
             cache_format_key=definition.cache_format_key,
         )
 
-    def _acquire_inflight(self, inflight_key: str) -> tuple[Future[dict[str, str | None]], bool]:
+    def _acquire_inflight(self, inflight_key: str) -> tuple[Future[dict[str, Any]], bool]:
         with self._coordination_lock:
             inflight = self._inflight.get(inflight_key)
             if inflight is not None:
                 return inflight.future, False
-            future: Future[dict[str, str | None]] = Future()
+            future: Future[dict[str, Any]] = Future()
             self._inflight[inflight_key] = _InFlightCall(future=future)
             return future, True
 
-    def _release_inflight(self, inflight_key: str | None, future: Future[dict[str, str | None]]) -> None:
+    def _release_inflight(self, inflight_key: str | None, future: Future[dict[str, Any]]) -> None:
         if inflight_key is None:
             return
         with self._coordination_lock:
@@ -395,12 +357,12 @@ class SharedTensorServer:
         encoding = params.get("encoding")
         if not isinstance(encoding, str) or not encoding:
             raise SharedTensorProtocolError("Missing required parameter 'encoding'")
-        args = deserialize_payload(encoding, params.get("args_hex", ""))
-        kwargs = deserialize_payload(encoding, params.get("kwargs_hex", ""))
+        args = deserialize_payload(encoding, params.get("args_bytes", b""))
+        kwargs = deserialize_payload(encoding, params.get("kwargs_bytes", b""))
         if not isinstance(args, tuple):
-            raise SharedTensorProtocolError("Decoded 'args_hex' must produce a tuple")
+            raise SharedTensorProtocolError("Decoded 'args_bytes' must produce a tuple")
         if not isinstance(kwargs, dict):
-            raise SharedTensorProtocolError("Decoded 'kwargs_hex' must produce a dict")
+            raise SharedTensorProtocolError("Decoded 'kwargs_bytes' must produce a dict")
         if encoding == CONTROL_ENCODING:
             if args or kwargs:
                 raise SharedTensorProtocolError(
@@ -411,11 +373,11 @@ class SharedTensorServer:
         validate_call_payload_for_transport(kwargs, allow_dict_keys=True)
         return endpoint, args, kwargs
 
-    def _encode_result(self, value: Any, *, object_id: str | None = None) -> dict[str, str | None]:
+    def _encode_result(self, value: Any, *, object_id: str | None = None) -> dict[str, Any]:
         if value is None:
-            return {"encoding": None, "payload_hex": None, "object_id": object_id}
+            return {"encoding": None, "payload_bytes": None, "object_id": object_id}
         encoding, payload = serialize_payload(value)
-        return {"encoding": encoding, "payload_hex": payload.hex(), "object_id": object_id}
+        return {"encoding": encoding, "payload_bytes": payload, "object_id": object_id}
 
     def _task_manager_instance(self) -> TaskManager:
         if self._task_manager is None:
@@ -444,8 +406,7 @@ class SharedTensorServer:
         return {
             "server": "SharedTensorServer",
             "version": "0.2.4",
-            "host": self.host,
-            "port": self.port,
+            "socket_path": self.socket_path,
             "uptime": uptime,
             "stats": dict(self.stats),
             "capabilities": capability_snapshot(),
@@ -467,14 +428,13 @@ class SharedTensorServer:
             target=self._serve_forever_from_payload,
             args=(
                 payload,
-                self.host,
-                self.port,
+                self.socket_path,
                 self.max_request_bytes,
                 self.max_workers,
                 self.result_ttl,
                 self.verbose_debug,
             ),
-            name=f"shared-tensor-daemon:{self.port}",
+            name=f"shared-tensor-daemon:{self.socket_path}",
         )
         process.start()
         self.server_process = process
@@ -484,8 +444,7 @@ class SharedTensorServer:
     @staticmethod
     def _serve_forever_from_payload(
         payload: bytes,
-        host: str,
-        port: int,
+        socket_path: str,
         max_request_bytes: int,
         max_workers: int,
         result_ttl: float,
@@ -495,8 +454,7 @@ class SharedTensorServer:
         provider = cloudpickle.loads(payload)
         server = SharedTensorServer(
             provider,
-            host=host,
-            port=port,
+            socket_path=socket_path,
             max_request_bytes=max_request_bytes,
             max_workers=max_workers,
             result_ttl=result_ttl,
@@ -506,14 +464,42 @@ class SharedTensorServer:
 
     def _serve_forever(self) -> None:
         self._configure_cuda_runtime()
-        self.server = ThreadedHTTPServer((self.host, self.port), SharedTensorRequestHandler)
-        self.server.shared_tensor_server = self  # type: ignore[attr-defined]
+        unlink_socket_path(self.socket_path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(self.socket_path)
+        listener.listen()
+        self.listener = listener
         self.running = True
         self.started_at = time.time()
         try:
-            self.server.serve_forever()
+            while self.running:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    if self.running:
+                        raise
+                    break
+                thread = threading.Thread(target=self._handle_connection, args=(conn,), daemon=True)
+                thread.start()
         finally:
             self._shutdown_local_resources()
+
+    def _handle_connection(self, conn: socket.socket) -> None:
+        with conn:
+            try:
+                request = recv_message(conn)
+                if not isinstance(request, dict):
+                    raise SharedTensorProtocolError("Transport request must be a dict")
+                response = self.process_request(request)
+            except Exception as exc:
+                response = {
+                    "ok": False,
+                    "error": {
+                        "code": self._error_code_for(exc),
+                        "message": str(exc),
+                    },
+                }
+            send_message(conn, response)
 
     @staticmethod
     def _configure_cuda_runtime() -> None:
@@ -529,7 +515,9 @@ class SharedTensorServer:
 
     def stop(self) -> None:
         if not self.running:
+            unlink_socket_path(self.socket_path)
             return
+        self.running = False
         if self.server_process is not None:
             self.server_process.terminate()
             self.server_process.join(timeout=5)
@@ -537,26 +525,24 @@ class SharedTensorServer:
                 self.server_process.kill()
                 self.server_process.join(timeout=5)
             self.server_process = None
-            self.running = False
+            unlink_socket_path(self.socket_path)
             return
+        if self.listener is not None:
+            self.listener.close()
         self._shutdown_local_resources()
-        self.running = False
 
     def _shutdown_local_resources(self) -> None:
-        if self.server is not None:
-            self.server.shutdown()
-            self.server.server_close()
-            self.server = None
+        if self.listener is not None:
+            self.listener.close()
+            self.listener = None
         if self._task_manager is not None:
             self._task_manager.shutdown(wait=False)
             self._task_manager = None
-        if self._call_executor is not None:
-            self._call_executor.shutdown(wait=False)
-            self._call_executor = None
         self._managed_objects.clear()
         self._cache.clear()
         self._inflight.clear()
         self._endpoint_locks.clear()
+        unlink_socket_path(self.socket_path)
 
     def __enter__(self) -> SharedTensorServer:
         self.start(blocking=False)
@@ -568,15 +554,15 @@ class SharedTensorServer:
     @staticmethod
     def _error_code_for(exc: Exception) -> int:
         if isinstance(exc, SharedTensorProtocolError):
-            return JsonRpcErrorCodes.INVALID_PARAMS
+            return 1
         if isinstance(exc, SharedTensorProviderError):
-            return JsonRpcErrorCodes.ENDPOINT_NOT_FOUND
+            return 2
         if isinstance(exc, SharedTensorSerializationError):
-            return JsonRpcErrorCodes.SERIALIZATION_ERROR
+            return 3
         if isinstance(exc, SharedTensorCapabilityError):
-            return JsonRpcErrorCodes.CAPABILITY_ERROR
+            return 4
         if isinstance(exc, SharedTensorTaskError):
-            return JsonRpcErrorCodes.TASK_ERROR
+            return 5
         if isinstance(exc, SharedTensorConfigurationError):
-            return JsonRpcErrorCodes.INTERNAL_ERROR
-        return JsonRpcErrorCodes.REMOTE_ERROR
+            return 6
+        return 7

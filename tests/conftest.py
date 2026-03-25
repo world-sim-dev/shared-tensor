@@ -1,38 +1,64 @@
 from __future__ import annotations
 
+import os
 import socket
+import tempfile
 import time
+from collections.abc import Iterator
 
 import pytest
 
-from shared_tensor import SharedTensorServer
-
-
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+from shared_tensor import SharedTensorClient, SharedTensorServer
 
 
 @pytest.fixture
-def running_server():
-    servers = []
+def running_server() -> Iterator:
+    servers: list[tuple[SharedTensorServer, str]] = []
 
     def factory(provider, **kwargs):
-        port = kwargs.pop("port", find_free_port())
-        server = SharedTensorServer(provider, host="127.0.0.1", port=port, **kwargs)
+        base_dir = tempfile.mkdtemp(prefix="shared-tensor-")
+        base_path = os.path.join(base_dir, "runtime")
+        provider.base_path = base_path
+        server = SharedTensorServer(provider, **kwargs)
         server.start(blocking=False)
         deadline = time.time() + 5
         while time.time() < deadline:
             try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                    break
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(0.2)
+                    sock.connect(server.socket_path)
+                break
             except OSError:
                 time.sleep(0.01)
-        servers.append(server)
+        else:
+            raise TimeoutError(f"Timed out waiting for server socket {server.socket_path}")
+        servers.append((server, base_dir))
         return server
 
     yield factory
 
-    for server in reversed(servers):
+    for server, base_dir in reversed(servers):
         server.stop()
+        try:
+            os.rmdir(base_dir)
+        except OSError:
+            pass
+
+
+@pytest.fixture
+def client_for_server():
+    clients: list[SharedTensorClient] = []
+
+    def factory(server: SharedTensorServer, **kwargs) -> SharedTensorClient:
+        client = SharedTensorClient(
+            base_path=server.provider.base_path,
+            device_index=server.provider.device_index,
+            **kwargs,
+        )
+        clients.append(client)
+        return client
+
+    yield factory
+
+    for client in reversed(clients):
+        client.close()

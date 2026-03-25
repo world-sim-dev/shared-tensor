@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import socket
+
 import pytest
 
 from shared_tensor.async_task import TaskStatus
@@ -22,7 +24,7 @@ def test_server_dispatch_handles_ping_and_unknown_method() -> None:
     result = server._dispatch("ping", {})
 
     assert result["pong"] is True
-    with pytest.raises(SharedTensorProtocolError, match="Unknown JSON-RPC method"):
+    with pytest.raises(SharedTensorProtocolError, match="Unknown RPC method"):
         server._dispatch("missing", {})
 
 
@@ -40,7 +42,9 @@ def test_server_dispatch_list_tasks_uses_status_filter() -> None:
 
     server._task_manager = FakeTaskManager()
 
-    assert server._dispatch("list_tasks", {"status": "completed"}) == {"task-1": {"status": "completed"}}
+    assert server._dispatch("list_tasks", {"status": "completed"}) == {
+        "task-1": {"status": "completed"}
+    }
 
 
 def test_server_decode_call_params_validates_control_encoding() -> None:
@@ -52,8 +56,8 @@ def test_server_decode_call_params_validates_control_encoding() -> None:
         {
             "endpoint": "noop",
             "encoding": CONTROL_ENCODING,
-            "args_hex": args_payload.hex(),
-            "kwargs_hex": kwargs_payload.hex(),
+            "args_bytes": args_payload,
+            "kwargs_bytes": kwargs_payload,
         }
     ) == ("noop", (), {})
 
@@ -75,8 +79,8 @@ def test_server_decode_call_params_rejects_non_empty_control_payload() -> None:
             {
                 "endpoint": "noop",
                 "encoding": CONTROL_ENCODING,
-                "args_hex": "80059505000000000000004b0185942e",
-                "kwargs_hex": "80057d942e",
+                "args_bytes": b"not-empty",
+                "kwargs_bytes": b"still-not-empty",
             }
         )
 
@@ -107,17 +111,17 @@ def test_server_handle_object_info_and_release() -> None:
 
 
 def test_server_get_server_info_contains_metadata() -> None:
-    provider = SharedTensorProvider(execution_mode="server")
+    provider = SharedTensorProvider(execution_mode="server", base_path="/tmp/test-shared-tensor")
 
     @provider.share
     def load() -> None:
         return None
 
-    server = SharedTensorServer(provider, port=9999)
+    server = SharedTensorServer(provider)
     info = server._get_server_info()
 
     assert info["server"] == "SharedTensorServer"
-    assert info["port"] == 9999
+    assert info["socket_path"].endswith("-0.sock")
     assert "load" in info["endpoints"]
     assert info["capabilities"]["transport"] == "same-host-cuda-torch-ipc"
 
@@ -136,3 +140,18 @@ def test_server_stop_is_idempotent() -> None:
     server = SharedTensorServer(SharedTensorProvider(execution_mode="server"))
     server.stop()
     server.stop()
+
+
+def test_server_handle_connection_returns_error_frame_for_invalid_request() -> None:
+    server = SharedTensorServer(SharedTensorProvider(execution_mode="server"))
+    left, right = socket.socketpair()
+    try:
+        left.sendall(b"\x00\x00\x00\x05hello")
+        left.shutdown(socket.SHUT_WR)
+        server._handle_connection(right)
+        payload = left.recv(4096)
+    finally:
+        left.close()
+        right.close()
+
+    assert payload

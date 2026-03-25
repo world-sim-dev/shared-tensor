@@ -15,6 +15,15 @@ from shared_tensor.errors import SharedTensorTaskError
 torch = pytest.importorskip("torch")
 
 
+def _client(server, **kwargs) -> AsyncSharedTensorClient:
+    return AsyncSharedTensorClient(
+        base_path=server.provider.base_path,
+        device_index=server.provider.device_index,
+        poll_interval=0.01,
+        **kwargs,
+    )
+
+
 def test_async_submit_and_result_flow(running_server) -> None:
     provider = AsyncSharedTensorProvider(execution_mode="server")
 
@@ -25,7 +34,7 @@ def test_async_submit_and_result_flow(running_server) -> None:
 
     server = running_server(provider)
 
-    with AsyncSharedTensorClient(base_port=server.port, poll_interval=0.01) as client:
+    with _client(server) as client:
         task_id = client.submit("slow_noop")
         assert client.wait_for_task(task_id, timeout=2) is None
         assert client.get_task_status(task_id).status == TaskStatus.COMPLETED
@@ -41,7 +50,7 @@ def test_async_cancel_pending_task(running_server) -> None:
 
     server = running_server(provider, max_workers=1)
 
-    with AsyncSharedTensorClient(base_port=server.port, poll_interval=0.01) as client:
+    with _client(server) as client:
         first = client.submit("slow_job")
         second = client.submit("slow_job")
         time.sleep(0.02)
@@ -61,7 +70,7 @@ def test_async_failed_task_surfaces_error(running_server) -> None:
 
     server = running_server(provider)
 
-    with AsyncSharedTensorClient(base_port=server.port, poll_interval=0.01) as client:
+    with _client(server) as client:
         task_id = client.submit("explode")
         with pytest.raises(SharedTensorTaskError):
             client.wait_for_task(task_id, timeout=2)
@@ -79,7 +88,7 @@ def test_async_managed_result_returns_handle(running_server) -> None:
 
     server = running_server(provider)
 
-    with AsyncSharedTensorClient(base_port=server.port, poll_interval=0.01) as client:
+    with _client(server) as client:
         task_id = client.submit("build_tensor")
         handle = client.wait_for_task(task_id, timeout=2)
         assert isinstance(handle, SharedObjectHandle)

@@ -8,6 +8,7 @@ import io
 import multiprocessing.reduction as mp_reduction
 import os
 import pickle
+from pathlib import Path
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -28,7 +29,8 @@ TORCH_MODULE: Any | None = _torch
 
 CONTROL_ENCODING = "control_pickle"
 TORCH_ENCODING = "torch_cuda_ipc"
-SHARED_TENSOR_BASE_PORT_ENV = "SHARED_TENSOR_BASE_PORT"
+SHARED_TENSOR_BASE_PATH_ENV = "SHARED_TENSOR_BASE_PATH"
+DEFAULT_SOCKET_BASE_PATH = "/tmp/shared-tensor"
 _EMPTY_TUPLE = ()
 _EMPTY_DICT: dict[str, Any] = {}
 
@@ -221,21 +223,8 @@ def deserialize_payload(encoding: str, data: bytes | str) -> Any:
         raise SharedTensorSerializationError(f"Failed to deserialize payload: {exc}") from exc
 
 
-def resolve_server_base_port(default_port: int) -> int:
-    """Resolve the configured base port from the environment."""
-    raw = os.getenv(SHARED_TENSOR_BASE_PORT_ENV)
-    if raw is None:
-        return default_port
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise SharedTensorConfigurationError(
-            f"{SHARED_TENSOR_BASE_PORT_ENV} must be an integer"
-        ) from exc
-
-
 def resolve_device_index(device_index: int | None = None) -> int:
-    """Resolve the CUDA device index for same-GPU port selection."""
+    """Resolve the CUDA device index for same-GPU socket selection."""
     if device_index is not None:
         if device_index < 0:
             raise SharedTensorConfigurationError("device_index must be >= 0")
@@ -245,9 +234,28 @@ def resolve_device_index(device_index: int | None = None) -> int:
     return int(TORCH_MODULE.cuda.current_device())
 
 
-def resolve_runtime_port(base_port: int, device_index: int | None = None) -> int:
-    """Resolve the runtime port by offsetting the base port by CUDA device index."""
-    return int(base_port) + resolve_device_index(device_index)
+def resolve_server_base_path(default_base_path: str = DEFAULT_SOCKET_BASE_PATH) -> str:
+    """Resolve the configured UDS base path from the environment."""
+    raw = os.getenv(SHARED_TENSOR_BASE_PATH_ENV)
+    if raw is None or not raw.strip():
+        return default_base_path
+    return raw.strip()
+
+
+def resolve_runtime_socket_path(
+    base_path: str = DEFAULT_SOCKET_BASE_PATH,
+    device_index: int | None = None,
+) -> str:
+    """Resolve the runtime UDS path by suffixing the CUDA device index."""
+    return f"{base_path}-{resolve_device_index(device_index)}.sock"
+
+
+def unlink_socket_path(socket_path: str) -> None:
+    """Best-effort removal of a stale unix socket path."""
+    try:
+        Path(socket_path).unlink()
+    except FileNotFoundError:
+        return
 
 
 def build_cache_key(
@@ -336,6 +344,8 @@ def _normalize_for_cache(obj: Any) -> Any:
             },
         }
     return {"__repr__": repr(obj), "__type__": type(obj).__name__}
+
+
 def capability_snapshot() -> dict[str, Any]:
     snapshot = {
         "torch_available": TORCH_MODULE is not None,

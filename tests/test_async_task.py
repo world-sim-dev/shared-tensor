@@ -23,7 +23,7 @@ def test_task_manager_wait_result_payload_for_none_result() -> None:
 
         payload = manager.wait_result_payload(info.task_id, timeout=1)
 
-        assert payload == {"encoding": None, "payload_hex": None, "object_id": None}
+        assert payload == {"encoding": None, "payload_bytes": None, "object_id": None}
         assert manager.get(info.task_id).status == TaskStatus.COMPLETED
     finally:
         manager.shutdown(wait=True)

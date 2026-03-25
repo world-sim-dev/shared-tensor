@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "shared-tensor"
 version = "0.2.4"
-description = "Local endpoint-oriented RPC for same-host same-GPU PyTorch IPC"
+description = "Native PyTorch CUDA IPC over Unix Domain Socket for same-host process separation"
 readme = "README.md"
 license = "Apache-2.0"
 authors = [
@@ -44,7 +44,6 @@ requires-python = ">=3.10"
 dependencies = [
     "cloudpickle>=3.0.0",
     "numpy<2",
-    "requests>=2.25.0",
     "torch>=2.2.0",
 ]
 
@@ -52,7 +51,6 @@ dependencies = [
 dev = [
     "pytest>=6.0",
     "pytest-cov>=2.0",
-    "types-requests>=2.32.0",
     "black>=22.0",
     "isort>=5.0",
     "mypy>=0.950",
@@ -134,7 +132,6 @@ strict_equality = true
 [[tool.mypy.overrides]]
 module = [
     "torch.*",
-    "requests.*",
 ]
 ignore_missing_imports = true
 

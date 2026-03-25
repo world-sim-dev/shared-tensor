@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-import threading
 import time
+from threading import Thread
 
 import pytest
 
-from shared_tensor import SharedObjectHandle, SharedTensorClient, SharedTensorProvider
-from shared_tensor.errors import SharedTensorCapabilityError, SharedTensorRemoteError
+from shared_tensor import SharedObjectHandle, SharedTensorProvider
+from shared_tensor.errors import SharedTensorRemoteError
+from shared_tensor.utils import resolve_runtime_socket_path
 
 torch = pytest.importorskip("torch")
 
 
-def test_sync_client_calls_registered_endpoint_with_empty_payload(running_server) -> None:
+def test_sync_client_calls_registered_endpoint_with_empty_payload(
+    running_server, client_for_server
+) -> None:
     provider = SharedTensorProvider(execution_mode="server")
 
     @provider.share
@@ -20,15 +23,16 @@ def test_sync_client_calls_registered_endpoint_with_empty_payload(running_server
 
     server = running_server(provider)
 
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         assert client.call("noop") is None
         info = client.get_server_info()
         assert info["server"] == "SharedTensorServer"
+        assert info["socket_path"] == server.socket_path
         assert info["capabilities"]["transport"] == "same-host-cuda-torch-ipc"
         assert "noop" in info["endpoints"]
 
 
-def test_sync_client_caches_empty_payload_results_server_side(running_server) -> None:
+def test_sync_client_caches_empty_payload_results_server_side(running_server, client_for_server) -> None:
     provider = SharedTensorProvider(execution_mode="server")
 
     @provider.share
@@ -37,12 +41,12 @@ def test_sync_client_caches_empty_payload_results_server_side(running_server) ->
 
     server = running_server(provider)
 
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         assert client.call("cached") is None
         assert client.call("cached") is None
 
 
-def test_sync_task_endpoint_waits_for_completion(running_server) -> None:
+def test_sync_task_endpoint_waits_for_completion(running_server, client_for_server) -> None:
     provider = SharedTensorProvider(execution_mode="server")
 
     @provider.share(execution="task")
@@ -53,12 +57,12 @@ def test_sync_task_endpoint_waits_for_completion(running_server) -> None:
     server = running_server(provider, max_workers=1)
 
     started = time.time()
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         assert client.call("delayed_none") is None
     assert time.time() - started >= 0.04
 
 
-def test_sync_client_uses_cache_format_key_for_server_cache(running_server) -> None:
+def test_sync_client_uses_cache_format_key_for_server_cache(running_server, client_for_server) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
@@ -70,14 +74,14 @@ def test_sync_client_uses_cache_format_key_for_server_cache(running_server) -> N
 
     server = running_server(provider)
 
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         first = client.call("versioned", torch.ones(1, device="cuda"), version=3)
         second = client.call("versioned", torch.zeros(1, device="cuda"), version=3)
 
     assert torch.equal(first.cpu(), second.cpu())
 
 
-def test_task_endpoint_singleflight_deduplicates_concurrent_calls(running_server) -> None:
+def test_task_endpoint_singleflight_deduplicates_concurrent_calls(running_server, client_for_server) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
@@ -94,15 +98,15 @@ def test_task_endpoint_singleflight_deduplicates_concurrent_calls(running_server
 
     def worker() -> None:
         try:
-            with SharedTensorClient(base_port=server.port) as client:
+            with client_for_server(server) as client:
                 handle = client.call("load_once")
                 assert isinstance(handle, SharedObjectHandle)
                 results.append(handle)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
-    first = threading.Thread(target=worker)
-    second = threading.Thread(target=worker)
+    first = Thread(target=worker)
+    second = Thread(target=worker)
     first.start()
     second.start()
     first.join(timeout=3)
@@ -112,7 +116,7 @@ def test_task_endpoint_singleflight_deduplicates_concurrent_calls(running_server
     assert len(results) == 2
     assert results[0].object_id == results[1].object_id
 
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         info = client.get_object_info(results[0].object_id)
         assert info is not None
         assert info["refcount"] == 2
@@ -121,7 +125,9 @@ def test_task_endpoint_singleflight_deduplicates_concurrent_calls(running_server
     assert results[1].release() is True
 
 
-def test_task_endpoint_serialized_concurrency_runs_one_at_a_time(running_server) -> None:
+def test_task_endpoint_serialized_concurrency_runs_one_at_a_time(
+    running_server, client_for_server
+) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
@@ -137,7 +143,7 @@ def test_task_endpoint_serialized_concurrency_runs_one_at_a_time(running_server)
 
     def worker(value: float) -> None:
         try:
-            with SharedTensorClient(base_port=server.port) as client:
+            with client_for_server(server) as client:
                 tensor = torch.full((1,), value, device="cuda")
                 result = client.call("serialized_job", tensor)
                 assert float(result.cpu()[0]) == value
@@ -145,8 +151,8 @@ def test_task_endpoint_serialized_concurrency_runs_one_at_a_time(running_server)
             errors.append(exc)
 
     started = time.time()
-    first = threading.Thread(target=worker, args=(1.0,))
-    second = threading.Thread(target=worker, args=(2.0,))
+    first = Thread(target=worker, args=(1.0,))
+    second = Thread(target=worker, args=(2.0,))
     first.start()
     second.start()
     first.join(timeout=3)
@@ -157,7 +163,7 @@ def test_task_endpoint_serialized_concurrency_runs_one_at_a_time(running_server)
     assert elapsed >= 0.28
 
 
-def test_managed_endpoint_returns_handle_and_supports_release(running_server) -> None:
+def test_managed_endpoint_returns_handle_and_supports_release(running_server, client_for_server) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
@@ -169,7 +175,7 @@ def test_managed_endpoint_returns_handle_and_supports_release(running_server) ->
 
     server = running_server(provider)
 
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         handle = client.call("managed_tensor")
         assert isinstance(handle, SharedObjectHandle)
         assert handle.value.is_cuda
@@ -183,7 +189,7 @@ def test_managed_endpoint_returns_handle_and_supports_release(running_server) ->
         assert handle.release() is False
 
 
-def test_managed_cached_endpoint_reuses_object_id_and_refcount(running_server) -> None:
+def test_managed_cached_endpoint_reuses_object_id_and_refcount(running_server, client_for_server) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
@@ -195,7 +201,7 @@ def test_managed_cached_endpoint_reuses_object_id_and_refcount(running_server) -
 
     server = running_server(provider)
 
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         first = client.call("cached_model", hidden_size=4)
         second = client.call("cached_model", hidden_size=4)
         assert isinstance(first, SharedObjectHandle)
@@ -212,7 +218,7 @@ def test_managed_cached_endpoint_reuses_object_id_and_refcount(running_server) -
         assert client.get_object_info(second.object_id) is None
 
 
-def test_managed_endpoint_without_cache_returns_distinct_handles(running_server) -> None:
+def test_managed_endpoint_without_cache_returns_distinct_handles(running_server, client_for_server) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
@@ -224,7 +230,7 @@ def test_managed_endpoint_without_cache_returns_distinct_handles(running_server)
 
     server = running_server(provider)
 
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         first = client.call("uncached_tensor")
         second = client.call("uncached_tensor")
         assert isinstance(first, SharedObjectHandle)
@@ -254,14 +260,14 @@ def test_server_mode_managed_endpoint_stays_local() -> None:
 def test_auto_server_mode_calls_shared_function_locally(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
     monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
-    monkeypatch.setenv("SHARED_TENSOR_BASE_PORT", "2541")
+    monkeypatch.setenv("SHARED_TENSOR_BASE_PATH", "/tmp/shared-tensor-auto")
 
     events: list[str] = []
 
     class FakeServer:
-        def __init__(self, provider, *, host, port, verbose_debug=False):
+        def __init__(self, provider, *, socket_path, verbose_debug=False):
             del provider, verbose_debug
-            events.append(f"init:{host}:{port}")
+            events.append(f"init:{socket_path}")
 
         def start(self, blocking=False):
             events.append(f"start:{blocking}")
@@ -278,32 +284,32 @@ def test_auto_server_mode_calls_shared_function_locally(monkeypatch: pytest.Monk
         return "ok"
 
     assert local_only() == "ok"
-    assert events == ["init:127.0.0.1:2541", "start:False"]
+    assert events == ["init:/tmp/shared-tensor-auto-0.sock", "start:False"]
 
     provider.close()
-    assert events == ["init:127.0.0.1:2541", "start:False", "stop"]
+    assert events == ["init:/tmp/shared-tensor-auto-0.sock", "start:False", "stop"]
 
 
-def test_client_uses_base_port_plus_device_index(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_client_uses_base_path_plus_device_index(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("shared_tensor.utils.resolve_device_index", lambda device_index=None: 2)
-    client = SharedTensorClient(base_port=2600)
+    client = SharedTensorProvider(execution_mode="client", base_path="/tmp/shared-tensor-client-path")
     try:
-        assert client.port == 2602
-        assert client.server_url == "http://127.0.0.1:2602"
+        resolved = resolve_runtime_socket_path(client.base_path)
+        assert resolved == "/tmp/shared-tensor-client-path-2.sock"
     finally:
         client.close()
 
 
-def test_sync_client_reports_unknown_endpoint(running_server) -> None:
+def test_sync_client_reports_unknown_endpoint(running_server, client_for_server) -> None:
     provider = SharedTensorProvider(execution_mode="server")
     server = running_server(provider)
 
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         with pytest.raises(SharedTensorRemoteError):
             client.call("missing")
 
 
-def test_sync_client_rejects_plain_python_result_payloads(running_server) -> None:
+def test_sync_client_rejects_plain_python_result_payloads(running_server, client_for_server) -> None:
     provider = SharedTensorProvider(execution_mode="server")
 
     @provider.share
@@ -312,12 +318,14 @@ def test_sync_client_rejects_plain_python_result_payloads(running_server) -> Non
 
     server = running_server(provider)
 
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         with pytest.raises(SharedTensorRemoteError):
             client.call("plain")
 
 
-def test_sync_client_rejects_plain_python_result_payloads_with_scalar_arg(running_server) -> None:
+def test_sync_client_rejects_plain_python_result_payloads_with_scalar_arg(
+    running_server, client_for_server
+) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
@@ -330,6 +338,6 @@ def test_sync_client_rejects_plain_python_result_payloads_with_scalar_arg(runnin
 
     server = running_server(provider)
 
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         with pytest.raises(SharedTensorRemoteError):
             client.call("echo", torch.ones(1, device="cuda"), value=1)

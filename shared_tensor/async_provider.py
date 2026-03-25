@@ -1,4 +1,4 @@
-"""Backward-compatible async-flavored provider facade."""
+"""Deprecated compatibility shim for task-oriented provider usage."""
 
 from __future__ import annotations
 
@@ -10,43 +10,6 @@ from shared_tensor.provider import SharedTensorProvider
 
 
 class AsyncSharedTensorProvider(SharedTensorProvider):
-    def __init__(
-        self,
-        base_port: int = 2537,
-        poll_interval: float = 1.0,
-        *,
-        enabled: bool | None = None,
-        server_host: str = "127.0.0.1",
-        device_index: int | None = None,
-        timeout: float = 30.0,
-        execution_mode: str = "auto",
-        verbose_debug: bool = False,
-    ) -> None:
-        super().__init__(
-            base_port=base_port,
-            enabled=enabled,
-            server_host=server_host,
-            device_index=device_index,
-            timeout=timeout,
-            execution_mode=execution_mode,
-            verbose_debug=verbose_debug,
-        )
-        self.poll_interval = poll_interval
-
-    def _get_async_client(self) -> Any:
-        if self._async_client is None:
-            from shared_tensor.async_client import AsyncSharedTensorClient
-
-            self._async_client = AsyncSharedTensorClient(
-                base_port=self.base_port,
-                host=self.server_host,
-                device_index=self.device_index,
-                timeout=self.timeout,
-                verbose_debug=self.verbose_debug,
-                poll_interval=self.poll_interval,
-            )
-        return self._async_client
-
     def register(
         self,
         func: Callable[..., Any],

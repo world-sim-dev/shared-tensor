@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-import socket
+import os
+import tempfile
 import time
 
 import pytest
@@ -12,24 +13,16 @@ from shared_tensor.errors import SharedTensorCapabilityError, SharedTensorRemote
 torch = pytest.importorskip("torch")
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _wait_for_server(port: int, timeout: float = 5.0) -> None:
+def _wait_for_socket(socket_path: str, timeout: float = 5.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                return
-        except OSError:
-            time.sleep(0.01)
-    raise TimeoutError(f"Timed out waiting for server on port {port}")
+        if os.path.exists(socket_path):
+            return
+        time.sleep(0.01)
+    raise TimeoutError(f"Timed out waiting for server socket {socket_path}")
 
 
-def test_cpu_tensor_round_trip_over_rpc_is_rejected(running_server) -> None:
+def test_cpu_tensor_round_trip_over_rpc_is_rejected(running_server, client_for_server) -> None:
     provider = SharedTensorProvider(execution_mode="server")
 
     @provider.share
@@ -39,12 +32,12 @@ def test_cpu_tensor_round_trip_over_rpc_is_rejected(running_server) -> None:
     server = running_server(provider)
     value = torch.arange(4, dtype=torch.float32)
 
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         with pytest.raises(SharedTensorCapabilityError):
             client.call("double_tensor", value)
 
 
-def test_cpu_model_round_trip_over_rpc_is_rejected(running_server) -> None:
+def test_cpu_model_round_trip_over_rpc_is_rejected(running_server, client_for_server) -> None:
     provider = SharedTensorProvider(execution_mode="server")
 
     @provider.share
@@ -53,7 +46,7 @@ def test_cpu_model_round_trip_over_rpc_is_rejected(running_server) -> None:
 
     server = running_server(provider)
 
-    with SharedTensorClient(base_port=server.port) as client:
+    with client_for_server(server) as client:
         with pytest.raises(SharedTensorRemoteError):
             client.call("build_linear")
 
@@ -69,12 +62,14 @@ def _gpu_model_round_trip_worker(queue) -> None:
             layer.bias.fill_(0.5)
         return layer
 
-    port = _find_free_port()
-    server = SharedTensorServer(provider, host="127.0.0.1", port=port)
+    base_dir = tempfile.mkdtemp(prefix="shared-tensor-gpu-model-")
+    base_path = os.path.join(base_dir, "runtime")
+    provider.base_path = base_path
+    server = SharedTensorServer(provider)
     server.start(blocking=False)
     try:
-        _wait_for_server(port)
-        with SharedTensorClient(base_port=port) as client:
+        _wait_for_socket(server.socket_path)
+        with SharedTensorClient(base_path=base_path) as client:
             model = client.call("build_cuda_linear")
         sample = torch.ones(1, 3, device="cuda")
         output = model(sample)
@@ -86,6 +81,10 @@ def _gpu_model_round_trip_worker(queue) -> None:
         )
     finally:
         server.stop()
+        try:
+            os.rmdir(base_dir)
+        except OSError:
+            pass
 
 
 def _gpu_tensor_round_trip_worker(queue) -> None:
@@ -95,13 +94,15 @@ def _gpu_tensor_round_trip_worker(queue) -> None:
     def identity(tensor):
         return tensor
 
-    port = _find_free_port()
-    server = SharedTensorServer(provider, host="127.0.0.1", port=port)
+    base_dir = tempfile.mkdtemp(prefix="shared-tensor-gpu-tensor-")
+    base_path = os.path.join(base_dir, "runtime")
+    provider.base_path = base_path
+    server = SharedTensorServer(provider)
     server.start(blocking=False)
     try:
-        _wait_for_server(port)
+        _wait_for_socket(server.socket_path)
         value = torch.arange(4, dtype=torch.float32, device="cuda")
-        with SharedTensorClient(base_port=port) as client:
+        with SharedTensorClient(base_path=base_path) as client:
             result = client.call("identity", value)
         queue.put(
             {
@@ -112,6 +113,10 @@ def _gpu_tensor_round_trip_worker(queue) -> None:
         )
     finally:
         server.stop()
+        try:
+            os.rmdir(base_dir)
+        except OSError:
+            pass
 
 
 def _run_gpu_worker(target):

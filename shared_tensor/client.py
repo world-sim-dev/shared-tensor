@@ -1,22 +1,21 @@
-"""Synchronous client for the shared_tensor local RPC server."""
+"""Synchronous client for the shared_tensor local UDS transport."""
 
 from __future__ import annotations
 
+import socket
 from dataclasses import dataclass
 from typing import Any, cast
-
-import requests
 
 from shared_tensor.errors import (
     SharedTensorClientError,
     SharedTensorProtocolError,
     SharedTensorRemoteError,
 )
-from shared_tensor.jsonrpc import JsonRpcRequest, parse_response
 from shared_tensor.managed_object import ReleaseHandle, SharedObjectHandle
+from shared_tensor.transport import recv_message, send_message
 from shared_tensor.utils import (
     deserialize_payload,
-    resolve_runtime_port,
+    resolve_runtime_socket_path,
     serialize_call_payloads,
 )
 
@@ -31,61 +30,50 @@ class _ClientReleaser(ReleaseHandle):
 
 
 class SharedTensorClient:
-    """JSON-RPC client for endpoint-oriented local RPC execution."""
+    """UDS client for endpoint-oriented local RPC execution."""
 
     def __init__(
         self,
-        base_port: int = 2537,
+        base_path: str = "/tmp/shared-tensor",
         *,
-        host: str = "127.0.0.1",
         device_index: int | None = None,
         timeout: float = 30.0,
         verbose_debug: bool = False,
     ) -> None:
-        self.host = host
-        self.base_port = base_port
+        self.base_path = base_path
         self.device_index = device_index
-        self.port = resolve_runtime_port(self.base_port, self.device_index)
+        self.socket_path = resolve_runtime_socket_path(self.base_path, self.device_index)
         self.timeout = timeout
         self.verbose_debug = verbose_debug
-        self.server_url = f"http://{host}:{self.port}"
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Content-Type": "application/json",
-                "User-Agent": "shared-tensor/modernized-client",
-            }
-        )
 
-    def _send_request(self, request: JsonRpcRequest) -> Any:
+    def _send_request(self, request: dict[str, Any]) -> Any:
         try:
-            response = self.session.post(
-                f"{self.server_url}/jsonrpc",
-                data=request.to_json(),
-                timeout=self.timeout,
-            )
-        except requests.exceptions.Timeout as exc:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self.timeout)
+                sock.connect(self.socket_path)
+                send_message(sock, request)
+                response = recv_message(sock)
+        except TimeoutError as exc:
             raise SharedTensorClientError(
-                f"Timed out after {self.timeout} seconds while contacting {self.server_url}"
+                f"Timed out after {self.timeout} seconds while contacting {self.socket_path}"
             ) from exc
-        except requests.exceptions.RequestException as exc:
-            raise SharedTensorClientError(f"Failed to contact {self.server_url}: {exc}") from exc
+        except OSError as exc:
+            raise SharedTensorClientError(f"Failed to contact {self.socket_path}: {exc}") from exc
 
-        if response.status_code != 200:
-            raise SharedTensorClientError(
-                f"Server returned HTTP {response.status_code}: {response.text}"
+        if not isinstance(response, dict):
+            raise SharedTensorProtocolError("Transport response must be a dict")
+        if response.get("ok") is not True:
+            error = response.get("error") or {}
+            message = error.get("message", "Unknown remote error")
+            code = error.get("code")
+            data = error.get("data")
+            raise SharedTensorRemoteError(
+                f"Remote error [{code}]: {message}" + (f" ({data})" if data else "")
             )
-
-        parsed = parse_response(response.text)
-        if parsed.error is not None:
-            message = parsed.error.get("message", "Unknown remote error")
-            code = parsed.error.get("code")
-            data = parsed.error.get("data")
-            raise SharedTensorRemoteError(f"Remote error [{code}]: {message}" + (f" ({data})" if data else ""))
-        return parsed.result
+        return response.get("result")
 
     def _request(self, method: str, params: dict[str, Any] | None = None) -> Any:
-        return self._send_request(JsonRpcRequest(method=method, params=params))
+        return self._send_request({"method": method, "params": params or {}})
 
     def call(self, endpoint: str, *args: Any, **kwargs: Any) -> Any:
         encoding, args_payload, kwargs_payload = serialize_call_payloads(tuple(args), dict(kwargs))
@@ -93,12 +81,25 @@ class SharedTensorClient:
             "call",
             {
                 "endpoint": endpoint,
-                "args_hex": args_payload.hex(),
-                "kwargs_hex": kwargs_payload.hex(),
+                "args_bytes": args_payload,
+                "kwargs_bytes": kwargs_payload,
                 "encoding": encoding,
             },
         )
         return self._decode_rpc_payload(result)
+
+    def submit(self, endpoint: str, *args: Any, **kwargs: Any) -> str:
+        encoding, args_payload, kwargs_payload = serialize_call_payloads(tuple(args), dict(kwargs))
+        result = self._request(
+            "submit",
+            {
+                "endpoint": endpoint,
+                "args_bytes": args_payload,
+                "kwargs_bytes": kwargs_payload,
+                "encoding": encoding,
+            },
+        )
+        return cast(str, result["task_id"])
 
     def release(self, object_id: str) -> bool:
         result = self._request("release_object", {"object_id": object_id})
@@ -115,9 +116,7 @@ class SharedTensorClient:
     def ping(self) -> bool:
         try:
             self._request("ping")
-        except SharedTensorClientError:
-            return False
-        except SharedTensorRemoteError:
+        except (SharedTensorClientError, SharedTensorRemoteError):
             return False
         return True
 
@@ -127,8 +126,27 @@ class SharedTensorClient:
     def list_endpoints(self) -> dict[str, Any]:
         return cast(dict[str, Any], self._request("list_endpoints"))
 
+    def get_task_status(self, task_id: str) -> dict[str, Any]:
+        return cast(dict[str, Any], self._request("get_task", {"task_id": task_id}))
+
+    def get_task_result(self, task_id: str) -> Any:
+        return self._decode_rpc_payload(self._request("get_task_result", {"task_id": task_id}))
+
+    def wait_task(self, task_id: str, timeout: float | None = None) -> dict[str, Any]:
+        params = {"task_id": task_id}
+        if timeout is not None:
+            params["timeout"] = timeout
+        return cast(dict[str, Any], self._request("wait_task", params))
+
+    def cancel_task(self, task_id: str) -> bool:
+        return bool(self._request("cancel_task", {"task_id": task_id})["cancelled"])
+
+    def list_tasks(self, status: str | None = None) -> dict[str, Any]:
+        params = {"status": status} if status else None
+        return cast(dict[str, Any], self._request("list_tasks", params))
+
     def close(self) -> None:
-        self.session.close()
+        return None
 
     def __enter__(self) -> SharedTensorClient:
         return self
@@ -138,12 +156,12 @@ class SharedTensorClient:
 
     def _decode_rpc_payload(self, result: dict[str, Any]) -> Any:
         encoding = result.get("encoding")
-        payload_hex = result.get("payload_hex")
+        payload_bytes = result.get("payload_bytes")
         if encoding is None:
             return None
-        if payload_hex is None:
-            raise SharedTensorProtocolError("RPC response is missing 'payload_hex'")
-        value = deserialize_payload(encoding, payload_hex)
+        if payload_bytes is None:
+            raise SharedTensorProtocolError("RPC response is missing 'payload_bytes'")
+        value = deserialize_payload(encoding, payload_bytes)
         object_id = result.get("object_id")
         if object_id is None:
             return value
