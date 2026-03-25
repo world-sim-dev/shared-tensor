@@ -2,10 +2,12 @@
 
 The examples directory only shows supported same-host CUDA torch IPC patterns.
 
+- [model_service.py](/Users/mapix/workspace/shared-tensor/examples/model_service.py): primary production-style server endpoint definitions
 - [zero_branch_env.py](/Users/mapix/workspace/shared-tensor/examples/zero_branch_env.py): one file, two processes, env-controlled auto mode
-- [model_service.py](/Users/mapix/workspace/shared-tensor/examples/model_service.py): cached managed model registry
 - [basic_service.py](/Users/mapix/workspace/shared-tensor/examples/basic_service.py): minimal direct endpoint examples
 - [async_service.py](/Users/mapix/workspace/shared-tensor/examples/async_service.py): task submission and wait flow
+
+Recommended production pattern: start a dedicated server process around `model_service.py`, then connect from clients with `SharedTensorClient`.
 
 Auto mode:
 

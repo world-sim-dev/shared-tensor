@@ -1,4 +1,4 @@
-"""Example model handoff pattern for same-host same-GPU torch IPC."""
+"""Production-style endpoint definitions for a dedicated shared_tensor server process."""
 
 from __future__ import annotations
 

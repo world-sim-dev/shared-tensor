@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-tensor"
-version = "0.2.5"
+version = "0.2.6"
 description = "Native PyTorch CUDA IPC over Unix Domain Socket for same-host process separation"
 readme = "README.md"
 license = "Apache-2.0"

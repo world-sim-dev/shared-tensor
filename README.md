@@ -13,6 +13,7 @@ Supported:
 - sync `call` and task-backed `submit`
 - managed object handles with explicit release
 - server-side caching, `cache_format_key`, and singleflight
+- manual two-process deployment as the primary production path
 - zero-branch auto mode gated by `SHARED_TENSOR_ENABLED=1`
 
 Not supported:
@@ -38,46 +39,58 @@ conda activate shared-tensor-dev
 pip install -e ".[dev,test]"
 ```
 
-## Example: Same Code, Two Processes
+## Example: Manual Two-Process Deployment
 
-See [examples/zero_branch_env.py](./examples/zero_branch_env.py).
+Production should prefer two explicitly started processes: one server process that owns CUDA objects, and one or more client processes that reopen them through torch IPC.
+
+See [examples/model_service.py](./examples/model_service.py) for endpoint definitions.
+
+Server process:
+
+```python
+from shared_tensor import SharedTensorProvider, SharedTensorServer
+
+provider = SharedTensorProvider(execution_mode="server")
+
+@provider.share(execution="task", managed=True, concurrency="serialized", cache_format_key="model:{hidden_size}")
+def load_model(hidden_size: int = 4):
+    ...
+
+server = SharedTensorServer(provider)
+server.start(blocking=True)
+```
+
+Client process:
 
 ```python
 import torch
 
-from shared_tensor import SharedObjectHandle, SharedTensorProvider
+from shared_tensor import SharedObjectHandle, SharedTensorClient
 
-provider = SharedTensorProvider()
-
-
-@provider.share(
-    execution="task",
-    managed=True,
-    concurrency="serialized",
-    cache_format_key="model:{hidden_size}",
-)
-def load_model(hidden_size: int = 4) -> torch.nn.Module:
-    return torch.nn.Linear(hidden_size, 2, device="cuda")
-
-
+client = SharedTensorClient()
 x = torch.ones(1, 4, device="cuda")
-result = load_model(hidden_size=4)
+result = client.call("load_model", hidden_size=4)
 if isinstance(result, SharedObjectHandle):
     with result as handle:
         y = handle.value(x)
-else:
-    y = result(x)
 ```
 
-Server process:
+This keeps the contract explicit:
+
+```text
+server process                      client process
+------------------------------      ------------------------------
+owns CUDA allocations               issues local UDS RPC requests
+executes endpoint functions         reopens CUDA objects via torch IPC
+manages cache and refcounts         releases managed handles explicitly
+```
+
+## Example: Same Code, Two Processes
+
+See [examples/zero_branch_env.py](./examples/zero_branch_env.py). This is a convenience mode for environments that want one file and environment-controlled behavior.
 
 ```bash
 SHARED_TENSOR_ENABLED=1 SHARED_TENSOR_ROLE=server python demo.py
-```
-
-Client process with the exact same file:
-
-```bash
 SHARED_TENSOR_ENABLED=1 python demo.py
 ```
 
@@ -88,7 +101,7 @@ same code
 
 server process                      client process
 ------------------------------      ------------------------------
-provider auto-starts UDS daemon     provider builds client wrappers
+provider auto-starts spawn daemon   provider builds client wrappers
 shared function runs locally        shared function becomes RPC call
 CUDA object stays on same GPU       CUDA object is reopened via torch IPC
 ```
@@ -160,8 +173,10 @@ Only `server_process_start_method="spawn"` is supported. Leave it as `None` to u
 
 `execution_mode="auto"` behaves as follows:
 - disabled: local mode
-- enabled + `SHARED_TENSOR_ROLE=server`: auto-start local server and execute endpoints locally
+- enabled + `SHARED_TENSOR_ROLE=server`: auto-start a spawn-based local background server and execute endpoints locally
 - enabled + role unset: build client wrappers
+
+For production deployment, prefer explicit `SharedTensorServer(...).start(blocking=True)` in a dedicated server process.
 
 Socket selection is per CUDA device:
 - base path comes from `SHARED_TENSOR_BASE_PATH` or `/tmp/shared-tensor`
