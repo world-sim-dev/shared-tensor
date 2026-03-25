@@ -32,14 +32,14 @@ def _wait_for_server(port: int, timeout: float = 5.0) -> None:
 def test_cpu_tensor_round_trip_over_rpc_is_rejected(running_server) -> None:
     provider = SharedTensorProvider(execution_mode="server")
 
-    @provider.share(name="double_tensor")
+    @provider.share
     def double_tensor(tensor):
         return tensor * 2
 
     server = running_server(provider)
     value = torch.arange(4, dtype=torch.float32)
 
-    with SharedTensorClient(port=server.port) as client:
+    with SharedTensorClient(base_port=server.port) as client:
         with pytest.raises(SharedTensorCapabilityError):
             client.call("double_tensor", value)
 
@@ -47,13 +47,13 @@ def test_cpu_tensor_round_trip_over_rpc_is_rejected(running_server) -> None:
 def test_cpu_model_round_trip_over_rpc_is_rejected(running_server) -> None:
     provider = SharedTensorProvider(execution_mode="server")
 
-    @provider.share(name="build_linear")
+    @provider.share
     def build_linear():
         return torch.nn.Linear(3, 2)
 
     server = running_server(provider)
 
-    with SharedTensorClient(port=server.port) as client:
+    with SharedTensorClient(base_port=server.port) as client:
         with pytest.raises(SharedTensorRemoteError):
             client.call("build_linear")
 
@@ -61,7 +61,7 @@ def test_cpu_model_round_trip_over_rpc_is_rejected(running_server) -> None:
 def _gpu_model_round_trip_worker(queue) -> None:
     provider = SharedTensorProvider(execution_mode="server")
 
-    @provider.share(name="build_cuda_linear")
+    @provider.share
     def build_cuda_linear():
         layer = torch.nn.Linear(3, 2).cuda()
         with torch.no_grad():
@@ -74,7 +74,7 @@ def _gpu_model_round_trip_worker(queue) -> None:
     server.start(blocking=False)
     try:
         _wait_for_server(port)
-        with SharedTensorClient(port=port) as client:
+        with SharedTensorClient(base_port=port) as client:
             model = client.call("build_cuda_linear")
         sample = torch.ones(1, 3, device="cuda")
         output = model(sample)
@@ -91,7 +91,7 @@ def _gpu_model_round_trip_worker(queue) -> None:
 def _gpu_tensor_round_trip_worker(queue) -> None:
     provider = SharedTensorProvider(execution_mode="server")
 
-    @provider.share(name="identity")
+    @provider.share(cache=False)
     def identity(tensor):
         return tensor
 
@@ -101,7 +101,7 @@ def _gpu_tensor_round_trip_worker(queue) -> None:
     try:
         _wait_for_server(port)
         value = torch.arange(4, dtype=torch.float32, device="cuda")
-        with SharedTensorClient(port=port) as client:
+        with SharedTensorClient(base_port=port) as client:
             result = client.call("identity", value)
         queue.put(
             {

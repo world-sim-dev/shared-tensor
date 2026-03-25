@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import argparse
 import logging
 import multiprocessing as mp
 import os
-import sys
+import threading
 import time
+from concurrent.futures import Future
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from multiprocessing.process import BaseProcess
 from socketserver import ThreadingMixIn
@@ -28,18 +29,23 @@ from shared_tensor.jsonrpc import (
     create_success_response,
     parse_request,
 )
-from shared_tensor.provider import SharedTensorProvider
+from shared_tensor.managed_object import ManagedObjectRegistry
+from shared_tensor.provider import EndpointDefinition, SharedTensorProvider
 from shared_tensor.utils import (
     CONTROL_ENCODING,
     build_cache_key,
     capability_snapshot,
     deserialize_payload,
-    load_object,
     serialize_payload,
     validate_payload_for_transport,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _InFlightCall:
+    future: Future[dict[str, str | None]]
 
 
 class SharedTensorRequestHandler(BaseHTTPRequestHandler):
@@ -120,7 +126,12 @@ class SharedTensorServer:
             "errors_encountered": 0,
         }
         self._task_manager: TaskManager | None = None
+        self._call_executor: TaskManager | None = None
         self._cache: dict[str, dict[str, str | None]] = {}
+        self._managed_objects = ManagedObjectRegistry()
+        self._inflight: dict[str, _InFlightCall] = {}
+        self._endpoint_locks: dict[str, threading.Lock] = {}
+        self._coordination_lock = threading.RLock()
 
     def health_response(self) -> str:
         from json import dumps
@@ -148,10 +159,14 @@ class SharedTensorServer:
             return self._get_server_info()
         if method == "list_endpoints":
             return self.provider.list_endpoints()
-        if method == "list_functions":
-            return self.provider.list_endpoints()
         if method == "call":
             return self._handle_call(params)
+        if method == "release_object":
+            return self._handle_release_object(params)
+        if method == "release_objects":
+            return self._handle_release_objects(params)
+        if method == "get_object_info":
+            return self._handle_get_object_info(params)
         if method == "submit":
             return self._handle_submit(params)
         if method == "get_task":
@@ -173,23 +188,199 @@ class SharedTensorServer:
     def _handle_call(self, params: dict[str, Any]) -> dict[str, str | None]:
         endpoint, args, kwargs = self._decode_call_params(params)
         definition = self.provider.get_endpoint(endpoint)
-        cache_key = None
-        if definition.cache:
-            cache_key = build_cache_key(endpoint, args, kwargs)
-            cached = self._cache.get(cache_key)
-            if cached is not None:
-                return cached
-        result = definition.func(*args, **kwargs)
-        encoded = self._encode_result(result)
-        if cache_key is not None:
-            self._cache[cache_key] = encoded
-        return encoded
+        if definition.execution == "task":
+            task_info = self._submit_endpoint_task(endpoint, definition, args, kwargs)
+            return self._task_manager_instance().wait_result_payload(task_info.task_id)
+        return self._execute_endpoint_call(endpoint, definition, args, kwargs)
 
     def _handle_submit(self, params: dict[str, Any]) -> dict[str, Any]:
         endpoint, args, kwargs = self._decode_call_params(params)
         definition = self.provider.get_endpoint(endpoint)
-        info = self._task_manager_instance().submit(endpoint, definition.func, args, kwargs)
+        info = self._submit_endpoint_task(endpoint, definition, args, kwargs)
         return info.to_dict()
+
+    def _submit_endpoint_task(
+        self,
+        endpoint: str,
+        definition: EndpointDefinition,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        return self._task_manager_instance().submit(
+            endpoint,
+            self._execute_endpoint_call,
+            (endpoint, definition, args, kwargs),
+            {},
+            result_encoder=lambda payload: payload,
+        )
+
+    def _execute_endpoint_call(
+        self,
+        endpoint: str,
+        definition: EndpointDefinition,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> dict[str, str | None]:
+        cache_key = self._cache_key(endpoint, definition, args, kwargs)
+        if cache_key is not None:
+            cached = self._lookup_cached_result(definition, cache_key)
+            if cached is not None:
+                return cached
+
+        inflight_key = cache_key if cache_key is not None and definition.singleflight else None
+        if inflight_key is not None:
+            future, owner = self._acquire_inflight(inflight_key)
+            if not owner:
+                return future.result()
+        else:
+            future = None
+
+        try:
+            encoded = self._run_endpoint_under_policy(endpoint, definition, args, kwargs, cache_key)
+        except Exception as exc:
+            if future is not None:
+                future.set_exception(exc)
+                self._release_inflight(inflight_key, future)
+            raise
+
+        if future is not None:
+            future.set_result(encoded)
+            self._release_inflight(inflight_key, future)
+        return encoded
+
+    def _run_endpoint_under_policy(
+        self,
+        endpoint: str,
+        definition: EndpointDefinition,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        cache_key: str | None,
+    ) -> dict[str, str | None]:
+        if definition.concurrency == "serialized":
+            lock = self._endpoint_lock(endpoint)
+            with lock:
+                cached = self._lookup_cached_result(definition, cache_key)
+                if cached is not None:
+                    return cached
+                return self._materialize_endpoint_result(endpoint, definition, args, kwargs, cache_key)
+        return self._materialize_endpoint_result(endpoint, definition, args, kwargs, cache_key)
+
+    def _materialize_endpoint_result(
+        self,
+        endpoint: str,
+        definition: EndpointDefinition,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        cache_key: str | None,
+    ) -> dict[str, str | None]:
+        if definition.managed:
+            result = self._materialize_managed_result(endpoint, definition, args, kwargs, cache_key)
+        else:
+            value = definition.func(*args, **kwargs)
+            result = self._encode_result(value)
+            if cache_key is not None:
+                self._cache[cache_key] = result
+        return result
+
+    def _materialize_managed_result(
+        self,
+        endpoint: str,
+        definition: EndpointDefinition,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        cache_key: str | None,
+    ) -> dict[str, str | None]:
+        if cache_key is not None:
+            cached = self._managed_objects.get_cached(cache_key)
+            if cached is not None:
+                self._managed_objects.add_ref(cached.object_id)
+                return self._encode_result(cached.value, object_id=cached.object_id)
+
+        result = definition.func(*args, **kwargs)
+        entry = self._managed_objects.register(endpoint=endpoint, value=result, cache_key=cache_key)
+        return self._encode_result(entry.value, object_id=entry.object_id)
+
+    def _lookup_cached_result(
+        self,
+        definition: EndpointDefinition,
+        cache_key: str | None,
+    ) -> dict[str, str | None] | None:
+        if cache_key is None:
+            return None
+        if definition.managed:
+            cached = self._managed_objects.get_cached(cache_key)
+            if cached is None:
+                return None
+            self._managed_objects.add_ref(cached.object_id)
+            return self._encode_result(cached.value, object_id=cached.object_id)
+        return self._cache.get(cache_key)
+
+    def _cache_key(
+        self,
+        endpoint: str,
+        definition: EndpointDefinition,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> str | None:
+        if not definition.cache:
+            return None
+        return build_cache_key(
+            endpoint,
+            args,
+            kwargs,
+            func=definition.func,
+            cache_format_key=definition.cache_format_key,
+        )
+
+    def _acquire_inflight(self, inflight_key: str) -> tuple[Future[dict[str, str | None]], bool]:
+        with self._coordination_lock:
+            inflight = self._inflight.get(inflight_key)
+            if inflight is not None:
+                return inflight.future, False
+            future: Future[dict[str, str | None]] = Future()
+            self._inflight[inflight_key] = _InFlightCall(future=future)
+            return future, True
+
+    def _release_inflight(self, inflight_key: str | None, future: Future[dict[str, str | None]]) -> None:
+        if inflight_key is None:
+            return
+        with self._coordination_lock:
+            current = self._inflight.get(inflight_key)
+            if current is not None and current.future is future:
+                self._inflight.pop(inflight_key, None)
+
+    def _endpoint_lock(self, endpoint: str) -> threading.Lock:
+        with self._coordination_lock:
+            lock = self._endpoint_locks.get(endpoint)
+            if lock is None:
+                lock = threading.Lock()
+                self._endpoint_locks[endpoint] = lock
+            return lock
+
+    def _handle_release_object(self, params: dict[str, Any]) -> dict[str, Any]:
+        object_id = self._require_object_id(params)
+        result = self._managed_objects.release(object_id)
+        return {
+            "object_id": object_id,
+            "released": result.released,
+            "destroyed": result.destroyed,
+            "refcount": result.refcount,
+        }
+
+    def _handle_release_objects(self, params: dict[str, Any]) -> dict[str, Any]:
+        object_ids = params.get("object_ids")
+        if not isinstance(object_ids, list) or not all(
+            isinstance(item, str) and item for item in object_ids
+        ):
+            raise SharedTensorProtocolError("Missing required parameter 'object_ids'")
+        released: dict[str, bool] = {}
+        for object_id in object_ids:
+            released[object_id] = self._managed_objects.release(object_id).released
+        return {"released": released}
+
+    def _handle_get_object_info(self, params: dict[str, Any]) -> dict[str, Any]:
+        object_id = self._require_object_id(params)
+        return {"object": self._managed_objects.info(object_id)}
 
     def _decode_call_params(self, params: dict[str, Any]) -> tuple[str, tuple[Any, ...], dict[str, Any]]:
         endpoint = params.get("endpoint")
@@ -214,11 +405,11 @@ class SharedTensorServer:
         validate_payload_for_transport(kwargs, allow_dict_keys=True)
         return endpoint, args, kwargs
 
-    def _encode_result(self, value: Any) -> dict[str, str | None]:
+    def _encode_result(self, value: Any, *, object_id: str | None = None) -> dict[str, str | None]:
         if value is None:
-            return {"encoding": None, "payload_hex": None}
+            return {"encoding": None, "payload_hex": None, "object_id": object_id}
         encoding, payload = serialize_payload(value)
-        return {"encoding": encoding, "payload_hex": payload.hex()}
+        return {"encoding": encoding, "payload_hex": payload.hex(), "object_id": object_id}
 
     def _task_manager_instance(self) -> TaskManager:
         if self._task_manager is None:
@@ -235,11 +426,18 @@ class SharedTensorServer:
             raise SharedTensorProtocolError("Missing required parameter 'task_id'")
         return task_id
 
+    @staticmethod
+    def _require_object_id(params: dict[str, Any]) -> str:
+        object_id = params.get("object_id")
+        if not isinstance(object_id, str) or not object_id:
+            raise SharedTensorProtocolError("Missing required parameter 'object_id'")
+        return object_id
+
     def _get_server_info(self) -> dict[str, Any]:
         uptime = 0.0 if self.started_at is None else time.time() - self.started_at
         return {
             "server": "SharedTensorServer",
-            "version": "0.2.0",
+            "version": "0.2.2",
             "host": self.host,
             "port": self.port,
             "uptime": uptime,
@@ -259,7 +457,7 @@ class SharedTensorServer:
                 "Non-blocking shared_tensor servers require POSIX fork semantics"
             )
         ctx = mp.get_context("fork")
-        process = ctx.Process(target=self._serve_forever, name=f"shared-tensor-server:{self.port}")
+        process = ctx.Process(target=self._serve_forever, name=f"shared-tensor-daemon:{self.port}")
         process.start()
         self.server_process = process
         self.running = True
@@ -310,6 +508,13 @@ class SharedTensorServer:
         if self._task_manager is not None:
             self._task_manager.shutdown(wait=False)
             self._task_manager = None
+        if self._call_executor is not None:
+            self._call_executor.shutdown(wait=False)
+            self._call_executor = None
+        self._managed_objects.clear()
+        self._cache.clear()
+        self._inflight.clear()
+        self._endpoint_locks.clear()
 
     def __enter__(self) -> SharedTensorServer:
         self.start(blocking=False)
@@ -333,49 +538,3 @@ class SharedTensorServer:
         if isinstance(exc, SharedTensorConfigurationError):
             return JsonRpcErrorCodes.INTERNAL_ERROR
         return JsonRpcErrorCodes.REMOTE_ERROR
-
-
-def load_server_target(target: str, *, host: str, port: int) -> SharedTensorServer:
-    obj = load_object(target)
-    if isinstance(obj, SharedTensorServer):
-        return obj
-    if callable(obj):
-        obj = obj()
-    if isinstance(obj, SharedTensorServer):
-        return obj
-    if isinstance(obj, SharedTensorProvider):
-        return SharedTensorServer(obj, host=host, port=port)
-    raise SharedTensorConfigurationError(
-        "Target must resolve to a SharedTensorProvider, SharedTensorServer, or a factory returning one"
-    )
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a shared_tensor endpoint server")
-    parser.add_argument("--provider", required=True, help="module:attribute for a provider/server or factory")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=2537)
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-    )
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-
-    server = load_server_target(args.provider, host=args.host, port=args.port)
-    try:
-        server.start(blocking=True)
-    except KeyboardInterrupt:
-        logger.info("Shutting down shared_tensor server")
-    finally:
-        server.stop()
-    return 0
-
-
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())

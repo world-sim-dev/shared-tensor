@@ -2,25 +2,18 @@
 
 The examples directory shows only supported same-host CUDA torch IPC patterns.
 
-- [basic_service.py](/Users/mapix/workspace/shared-tensor/examples/basic_service.py): synchronous CUDA model and tensor handoff
+- [zero_branch_env.py](/Users/mapix/workspace/shared-tensor/examples/zero_branch_env.py): one file, two processes, `SHARED_TENSOR_ROLE=server` auto-daemon mode with task-backed model loading
+- [basic_service.py](/Users/mapix/workspace/shared-tensor/examples/basic_service.py): direct synchronous tensor and module endpoints
 - [async_service.py](/Users/mapix/workspace/shared-tensor/examples/async_service.py): async task endpoints returning CUDA objects
-- [model_service.py](/Users/mapix/workspace/shared-tensor/examples/model_service.py): minimal model/tensor workflow on one GPU
+- [model_service.py](/Users/mapix/workspace/shared-tensor/examples/model_service.py): serialized model construction with managed handles
 
-Run a service:
+Port selection is `base_port + cuda_device_index`. By default the base port is `2537`, or `SHARED_TENSOR_BASE_PORT` when set.
+
+Auto mode:
 
 ```bash
-shared-tensor-server --provider examples.basic_service:provider --port 2537
+SHARED_TENSOR_ROLE=server python examples/zero_branch_env.py
+python examples/zero_branch_env.py
 ```
 
-Then call it from Python:
-
-```python
-import torch
-
-from shared_tensor import SharedTensorClient
-
-with SharedTensorClient(port=2537) as client:
-    model = client.call("build_linear_model")
-    x = torch.ones(1, 4, device="cuda")
-    print(model(x))
-```
+Manual mode is programmatic only. Construct `SharedTensorServer(provider, port=...)` and call `start()`.

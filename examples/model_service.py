@@ -6,7 +6,7 @@ import torch
 
 from shared_tensor import SharedTensorProvider
 
-provider = SharedTensorProvider(execution_mode="client")
+provider = SharedTensorProvider()
 
 
 def _require_cuda() -> None:
@@ -14,7 +14,7 @@ def _require_cuda() -> None:
         raise RuntimeError("CUDA is required for this example")
 
 
-@provider.share(name="load_linear_model")
+@provider.share(execution="task", managed=True, concurrency="serialized", cache_format_key="model:{input_dim}:{output_dim}")
 def load_linear_model(input_dim: int = 16, output_dim: int = 4) -> torch.nn.Module:
     _require_cuda()
     layer = torch.nn.Linear(input_dim, output_dim, device="cuda")
@@ -24,7 +24,7 @@ def load_linear_model(input_dim: int = 16, output_dim: int = 4) -> torch.nn.Modu
     return layer
 
 
-@provider.share(name="scale_tensor")
+@provider.share(execution="direct", cache=False)
 def scale_tensor(tensor: torch.Tensor, factor: torch.Tensor) -> torch.Tensor:
     _require_cuda()
     return tensor * factor

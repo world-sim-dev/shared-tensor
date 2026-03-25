@@ -9,23 +9,25 @@ from typing import Any, cast
 from shared_tensor.async_task import TaskInfo, TaskStatus
 from shared_tensor.client import SharedTensorClient
 from shared_tensor.errors import SharedTensorTaskError
-from shared_tensor.utils import resolve_legacy_endpoint_name, serialize_call_payloads
+from shared_tensor.utils import serialize_call_payloads
 
 
 class AsyncSharedTensorClient:
     def __init__(
         self,
-        port: int = 2537,
+        base_port: int = 2537,
         verbose_debug: bool = False,
         poll_interval: float = 1.0,
         *,
         host: str = "127.0.0.1",
+        device_index: int | None = None,
         timeout: float = 30.0,
     ) -> None:
         self.poll_interval = poll_interval
         self._client = SharedTensorClient(
-            port=port,
+            base_port=base_port,
             host=host,
+            device_index=device_index,
             timeout=timeout,
             verbose_debug=verbose_debug,
         )
@@ -43,17 +45,6 @@ class AsyncSharedTensorClient:
         )
         return cast(str, result["task_id"])
 
-    def submit_task(
-        self,
-        function_path: str,
-        args: tuple[Any, ...] = (),
-        kwargs: dict[str, Any] | None = None,
-        options: dict[str, Any] | None = None,
-    ) -> str:
-        del options
-        endpoint = resolve_legacy_endpoint_name(function_path)
-        return self.submit(endpoint, *(args or ()), **(kwargs or {}))
-
     def status(self, task_id: str) -> TaskInfo:
         return TaskInfo.from_dict(self._client._request("get_task", {"task_id": task_id}))
 
@@ -62,7 +53,7 @@ class AsyncSharedTensorClient:
 
     def result(self, task_id: str) -> Any:
         result = self._client._request("get_task_result", {"task_id": task_id})
-        return SharedTensorClient._decode_rpc_payload(result)
+        return self._client._decode_rpc_payload(result)
 
     def get_task_result(self, task_id: str) -> Any:
         return self.result(task_id)
@@ -98,22 +89,6 @@ class AsyncSharedTensorClient:
     ) -> Any:
         return self.wait(task_id, timeout=timeout, callback=callback)
 
-    def execute_function_async(
-        self,
-        function_path: str,
-        args: tuple[Any, ...] = (),
-        kwargs: dict[str, Any] | None = None,
-        options: dict[str, Any] | None = None,
-        wait: bool = True,
-        timeout: float | None = None,
-        callback: Callable[[TaskInfo], None] | None = None,
-    ) -> Any:
-        del options
-        task_id = self.submit_task(function_path, args=args, kwargs=kwargs)
-        if not wait:
-            return task_id
-        return self.wait(task_id, timeout=timeout, callback=callback)
-
     def cancel(self, task_id: str) -> bool:
         return bool(self._client._request("cancel_task", {"task_id": task_id})["cancelled"])
 
@@ -133,34 +108,3 @@ class AsyncSharedTensorClient:
 
     def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
         self.close()
-
-
-def execute_remote_function_async(
-    function_path: str,
-    args: tuple[Any, ...] = (),
-    kwargs: dict[str, Any] | None = None,
-    options: dict[str, Any] | None = None,
-    *,
-    server_port: int = 2537,
-    host: str = "127.0.0.1",
-    verbose_debug: bool = False,
-    poll_interval: float = 1.0,
-    wait: bool = True,
-    timeout: float | None = None,
-    callback: Callable[[TaskInfo], None] | None = None,
-) -> Any:
-    with AsyncSharedTensorClient(
-        port=server_port,
-        host=host,
-        verbose_debug=verbose_debug,
-        poll_interval=poll_interval,
-    ) as client:
-        return client.execute_function_async(
-            function_path,
-            args=args,
-            kwargs=kwargs,
-            options=options,
-            wait=wait,
-            timeout=timeout,
-            callback=callback,
-        )

@@ -4,6 +4,7 @@ from shared_tensor.async_client import AsyncSharedTensorClient
 from shared_tensor.async_provider import AsyncSharedTensorProvider
 from shared_tensor.async_task import TaskInfo, TaskStatus
 from shared_tensor.client import SharedTensorClient
+from shared_tensor.managed_object import SharedObjectHandle
 from shared_tensor.provider import SharedTensorProvider
 from shared_tensor.server import SharedTensorServer
 
@@ -11,10 +12,11 @@ __all__ = [
     "AsyncSharedTensorClient",
     "AsyncSharedTensorProvider",
     "SharedTensorClient",
+    "SharedObjectHandle",
     "SharedTensorProvider",
     "SharedTensorServer",
     "TaskInfo",
     "TaskStatus",
 ]
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"

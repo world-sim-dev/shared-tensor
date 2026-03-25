@@ -7,9 +7,13 @@ import pytest
 from shared_tensor.errors import SharedTensorCapabilityError
 from shared_tensor.utils import (
     CONTROL_ENCODING,
+    SHARED_TENSOR_BASE_PORT_ENV,
     TORCH_ENCODING,
     build_cache_key,
     deserialize_payload,
+    format_cache_key,
+    resolve_runtime_port,
+    resolve_server_base_port,
     serialize_call_payloads,
     serialize_empty_payload,
     serialize_payload,
@@ -55,6 +59,32 @@ def test_cache_key_is_stable_for_equivalent_inputs() -> None:
     left = build_cache_key("sum", (1, 2), {"scale": 3})
     right = build_cache_key("sum", (1, 2), {"scale": 3})
     assert left == right
+
+
+def test_cache_key_can_use_format_string() -> None:
+    def op(value, scale=1):
+        return value
+
+    left = build_cache_key("sum", (1,), {"scale": 3}, func=op, cache_format_key="{scale}")
+    right = build_cache_key("sum", (99,), {"scale": 3}, func=op, cache_format_key="{scale}")
+    assert left == right
+
+
+def test_format_cache_key_defaults_from_function_signature() -> None:
+    def op(value, scale=7):
+        return value
+
+    assert format_cache_key(op, (1,), {}, "{scale}") == "7"
+
+
+def test_resolve_server_base_port_uses_new_env_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(SHARED_TENSOR_BASE_PORT_ENV, "4567")
+    assert resolve_server_base_port(2537) == 4567
+
+
+def test_resolve_runtime_port_offsets_base_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shared_tensor.utils.resolve_device_index", lambda device_index=None: 4)
+    assert resolve_runtime_port(3000) == 3004
 
 
 def _produce_cuda_payload(kind: str, payload_queue, release_queue) -> None:

@@ -6,7 +6,7 @@ import torch
 
 from shared_tensor import SharedTensorProvider
 
-provider = SharedTensorProvider(execution_mode="client")
+provider = SharedTensorProvider()
 
 
 def _require_cuda() -> None:
@@ -14,7 +14,7 @@ def _require_cuda() -> None:
         raise RuntimeError("CUDA is required for this example")
 
 
-@provider.share(name="build_linear_model")
+@provider.share(execution="direct")
 def build_linear_model() -> torch.nn.Module:
     _require_cuda()
     layer = torch.nn.Linear(4, 2, device="cuda")
@@ -24,7 +24,7 @@ def build_linear_model() -> torch.nn.Module:
     return layer
 
 
-@provider.share(name="echo_tensor")
+@provider.share(execution="direct", cache=False)
 def echo_tensor(tensor: torch.Tensor) -> torch.Tensor:
     _require_cuda()
     return tensor

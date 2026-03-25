@@ -8,7 +8,7 @@ import torch
 
 from shared_tensor import AsyncSharedTensorProvider
 
-provider = AsyncSharedTensorProvider(execution_mode="client", poll_interval=0.05)
+provider = AsyncSharedTensorProvider(poll_interval=0.05)
 
 
 def _require_cuda() -> None:
@@ -16,14 +16,14 @@ def _require_cuda() -> None:
         raise RuntimeError("CUDA is required for this example")
 
 
-@provider.share(name="build_delayed_model", wait=False)
+@provider.share(wait=False)
 def build_delayed_model(delay: float = 0.1) -> torch.nn.Module:
     _require_cuda()
     time.sleep(delay)
     return torch.nn.Linear(8, 4, device="cuda")
 
 
-@provider.share(name="clone_tensor_async", wait=True)
+@provider.share
 def clone_tensor_async(tensor: torch.Tensor) -> torch.Tensor:
     _require_cuda()
     return tensor.clone()

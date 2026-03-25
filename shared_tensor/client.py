@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, cast
 
 import requests
@@ -12,11 +13,21 @@ from shared_tensor.errors import (
     SharedTensorRemoteError,
 )
 from shared_tensor.jsonrpc import JsonRpcRequest, parse_response
+from shared_tensor.managed_object import ReleaseHandle, SharedObjectHandle
 from shared_tensor.utils import (
     deserialize_payload,
-    resolve_legacy_endpoint_name,
+    resolve_runtime_port,
     serialize_call_payloads,
 )
+
+
+@dataclass(slots=True)
+class _ClientReleaser(ReleaseHandle):
+    client: SharedTensorClient
+    object_id: str
+
+    def release(self) -> bool:
+        return self.client.release(self.object_id)
 
 
 class SharedTensorClient:
@@ -24,17 +35,20 @@ class SharedTensorClient:
 
     def __init__(
         self,
-        port: int = 2537,
+        base_port: int = 2537,
         *,
         host: str = "127.0.0.1",
+        device_index: int | None = None,
         timeout: float = 30.0,
         verbose_debug: bool = False,
     ) -> None:
         self.host = host
-        self.port = port
+        self.base_port = base_port
+        self.device_index = device_index
+        self.port = resolve_runtime_port(self.base_port, self.device_index)
         self.timeout = timeout
         self.verbose_debug = verbose_debug
-        self.server_url = f"http://{host}:{port}"
+        self.server_url = f"http://{host}:{self.port}"
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -86,16 +100,17 @@ class SharedTensorClient:
         )
         return self._decode_rpc_payload(result)
 
-    def execute_function(
-        self,
-        function_path: str,
-        args: tuple[Any, ...] = (),
-        kwargs: dict[str, Any] | None = None,
-        options: dict[str, Any] | None = None,
-    ) -> Any:
-        del options
-        endpoint = resolve_legacy_endpoint_name(function_path)
-        return self.call(endpoint, *(args or ()), **(kwargs or {}))
+    def release(self, object_id: str) -> bool:
+        result = self._request("release_object", {"object_id": object_id})
+        return bool(result["released"])
+
+    def release_many(self, object_ids: list[str]) -> dict[str, bool]:
+        result = self._request("release_objects", {"object_ids": object_ids})
+        return {object_id: bool(released) for object_id, released in result["released"].items()}
+
+    def get_object_info(self, object_id: str) -> dict[str, Any] | None:
+        result = self._request("get_object_info", {"object_id": object_id})
+        return cast(dict[str, Any] | None, result.get("object"))
 
     def ping(self) -> bool:
         try:
@@ -112,9 +127,6 @@ class SharedTensorClient:
     def list_endpoints(self) -> dict[str, Any]:
         return cast(dict[str, Any], self._request("list_endpoints"))
 
-    def list_functions(self) -> dict[str, Any]:
-        return self.list_endpoints()
-
     def close(self) -> None:
         self.session.close()
 
@@ -124,31 +136,19 @@ class SharedTensorClient:
     def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
         self.close()
 
-    @staticmethod
-    def _decode_rpc_payload(result: dict[str, Any]) -> Any:
+    def _decode_rpc_payload(self, result: dict[str, Any]) -> Any:
         encoding = result.get("encoding")
         payload_hex = result.get("payload_hex")
         if encoding is None:
             return None
         if payload_hex is None:
             raise SharedTensorProtocolError("RPC response is missing 'payload_hex'")
-        return deserialize_payload(encoding, payload_hex)
-
-
-def execute_remote_function(
-    function_path: str,
-    args: tuple[Any, ...] = (),
-    kwargs: dict[str, Any] | None = None,
-    *,
-    server_port: int = 2537,
-    host: str = "127.0.0.1",
-    timeout: float = 30.0,
-    verbose_debug: bool = False,
-) -> Any:
-    with SharedTensorClient(
-        port=server_port,
-        host=host,
-        timeout=timeout,
-        verbose_debug=verbose_debug,
-    ) as client:
-        return client.execute_function(function_path, args=args, kwargs=kwargs)
+        value = deserialize_payload(encoding, payload_hex)
+        object_id = result.get("object_id")
+        if object_id is None:
+            return value
+        return SharedObjectHandle(
+            object_id=cast(str, object_id),
+            value=value,
+            _releaser=_ClientReleaser(client=self, object_id=cast(str, object_id)),
+        )

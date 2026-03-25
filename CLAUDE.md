@@ -28,6 +28,9 @@ This repository exists to move CUDA `torch.Tensor` and CUDA `torch.nn.Module` ob
 
 - Prefer explicit endpoint names over import-path execution.
 - Keep sync and async interfaces aligned.
+- Automatic localhost server startup in provider auto mode is allowed.
+- Default result caching is part of the product contract.
+- `cache_format_key` must stay explicit, string-based, and easy to reason about.
 - Keep compatibility helpers small and secondary to the main API.
 - Remove design complexity instead of hiding it behind more configuration.
 

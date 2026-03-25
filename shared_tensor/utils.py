@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import inspect
 import io
+import os
 import pickle
 from collections.abc import Callable
 from typing import Any, cast
@@ -27,6 +27,7 @@ TORCH_MODULE: Any | None = _torch
 
 CONTROL_ENCODING = "control_pickle"
 TORCH_ENCODING = "torch_cuda_ipc"
+SHARED_TENSOR_BASE_PORT_ENV = "SHARED_TENSOR_BASE_PORT"
 _EMPTY_TUPLE = ()
 _EMPTY_DICT: dict[str, Any] = {}
 
@@ -165,12 +166,83 @@ def deserialize_payload(encoding: str, data: bytes | str) -> Any:
         raise SharedTensorSerializationError(f"Failed to deserialize payload: {exc}") from exc
 
 
-def build_cache_key(endpoint_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+def resolve_server_base_port(default_port: int) -> int:
+    """Resolve the configured base port from the environment."""
+    raw = os.getenv(SHARED_TENSOR_BASE_PORT_ENV)
+    if raw is None:
+        return default_port
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise SharedTensorConfigurationError(
+            f"{SHARED_TENSOR_BASE_PORT_ENV} must be an integer"
+        ) from exc
+
+
+def resolve_device_index(device_index: int | None = None) -> int:
+    """Resolve the CUDA device index for same-GPU port selection."""
+    if device_index is not None:
+        if device_index < 0:
+            raise SharedTensorConfigurationError("device_index must be >= 0")
+        return device_index
+    if TORCH_MODULE is None or not TORCH_MODULE.cuda.is_available():
+        return 0
+    return int(TORCH_MODULE.cuda.current_device())
+
+
+def resolve_runtime_port(base_port: int, device_index: int | None = None) -> int:
+    """Resolve the runtime port by offsetting the base port by CUDA device index."""
+    return int(base_port) + resolve_device_index(device_index)
+
+
+def build_cache_key(
+    endpoint_name: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    func: Callable[..., Any] | None = None,
+    cache_format_key: str | None = None,
+) -> str:
     """Build a deterministic cache key for endpoint calls."""
     digest = hashlib.sha256()
     digest.update(endpoint_name.encode("utf-8"))
-    digest.update(pickle.dumps((_normalize_for_cache(args), _normalize_for_cache(kwargs)), protocol=4))
+    if cache_format_key is not None:
+        if func is None:
+            raise SharedTensorConfigurationError(
+                "func is required when cache_format_key is configured"
+            )
+        formatted_key = format_cache_key(func, args, kwargs, cache_format_key)
+        payload = {"cache_format_key": formatted_key}
+    else:
+        payload = {
+            "args": _normalize_for_cache(args),
+            "kwargs": _normalize_for_cache(kwargs),
+        }
+    digest.update(pickle.dumps(payload, protocol=4))
     return digest.hexdigest()
+
+
+def format_cache_key(
+    func: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    cache_format_key: str,
+) -> str:
+    """Format a cache key from bound function arguments."""
+    try:
+        bound = inspect.signature(func).bind(*args, **kwargs)
+    except TypeError as exc:
+        raise SharedTensorConfigurationError(
+            f"Unable to bind arguments for cache_format_key on {func.__qualname__}: {exc}"
+        ) from exc
+    bound.apply_defaults()
+    try:
+        return cache_format_key.format(**bound.arguments)
+    except KeyError as exc:
+        missing = exc.args[0]
+        raise SharedTensorConfigurationError(
+            f"cache_format_key for {func.__qualname__} references unknown argument '{missing}'"
+        ) from exc
 
 
 def _normalize_for_cache(obj: Any) -> Any:
@@ -209,44 +281,6 @@ def _normalize_for_cache(obj: Any) -> Any:
             },
         }
     return {"__repr__": repr(obj), "__type__": type(obj).__name__}
-
-
-def resolve_legacy_endpoint_name(function_path: str) -> str:
-    """Map an old-style function path to the endpoint name portion."""
-    if not function_path:
-        raise SharedTensorConfigurationError("function_path must not be empty")
-    if ":" not in function_path:
-        return function_path
-    _, endpoint = function_path.rsplit(":", 1)
-    return endpoint.split(".")[-1]
-
-
-def load_object(target: str) -> Any:
-    """Load ``module:attribute`` references for CLI entrypoints."""
-    if ":" not in target:
-        raise SharedTensorConfigurationError(
-            f"Invalid target '{target}'. Expected 'module:attribute'."
-        )
-    module_name, attr_name = target.split(":", 1)
-    module = importlib.import_module(module_name)
-    obj: Any = module
-    for attr in attr_name.split("."):
-        obj = getattr(obj, attr)
-    return obj
-
-
-def infer_function_path(func: Callable[..., Any]) -> str:
-    """Return an importable path for debugging and compatibility only."""
-    module = inspect.getmodule(func)
-    if module is None or not getattr(module, "__name__", None):
-        raise SharedTensorConfigurationError(f"Unable to resolve module for {func!r}")
-    module_name = module.__name__
-    module_file = getattr(module, "__file__", None)
-    if module_name == "__main__" and module_file:
-        module_name = inspect.getmodulename(module_file) or module_name
-    return f"{module_name}:{func.__qualname__}"
-
-
 def capability_snapshot() -> dict[str, Any]:
     snapshot = {
         "torch_available": TORCH_MODULE is not None,

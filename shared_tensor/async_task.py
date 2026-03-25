@@ -7,6 +7,7 @@ import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import RLock
@@ -92,6 +93,7 @@ class TaskManager:
         func: Callable[..., Any],
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
+        result_encoder: Callable[[Any], dict[str, Any]] | None = None,
     ) -> TaskInfo:
         self._maybe_cleanup()
         with self._lock:
@@ -105,7 +107,14 @@ class TaskManager:
                 status=TaskStatus.PENDING,
                 created_at=time.time(),
             )
-            future = self._executor.submit(self._run_task, info.task_id, func, args, kwargs)
+            future = self._executor.submit(
+                self._run_task,
+                info.task_id,
+                func,
+                args,
+                kwargs,
+                result_encoder,
+            )
             self._tasks[info.task_id] = _TaskEntry(info=info, future=future)
             return copy.deepcopy(info)
 
@@ -115,6 +124,7 @@ class TaskManager:
         func: Callable[..., Any],
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
+        result_encoder: Callable[[Any], dict[str, Any]] | None,
     ) -> None:
         self._transition(task_id, status=TaskStatus.RUNNING, started_at=time.time())
         try:
@@ -140,7 +150,11 @@ class TaskManager:
             return
 
         try:
-            encoding, payload = serialize_payload(result)
+            payload = (
+                result_encoder(result)
+                if result_encoder is not None
+                else self._default_result_encoder(result)
+            )
         except Exception as exc:  # pragma: no cover - hit in integration tests
             self._transition(
                 task_id,
@@ -155,9 +169,19 @@ class TaskManager:
             task_id,
             status=TaskStatus.COMPLETED,
             completed_at=time.time(),
-            result_encoding=encoding,
-            result_hex=payload.hex(),
+            result_encoding=payload["encoding"],
+            result_hex=payload["payload_hex"],
+            metadata={"object_id": payload.get("object_id")},
         )
+
+    @staticmethod
+    def _default_result_encoder(value: Any) -> dict[str, Any]:
+        encoding, payload = serialize_payload(value)
+        return {
+            "encoding": encoding,
+            "payload_hex": payload.hex(),
+            "object_id": None,
+        }
 
     def _transition(self, task_id: str, **updates: Any) -> None:
         with self._lock:
@@ -183,6 +207,25 @@ class TaskManager:
             return None
         return deserialize_payload(encoding, payload_hex)
 
+    def wait_result_payload(
+        self,
+        task_id: str,
+        timeout: float | None = None,
+    ) -> dict[str, str | None]:
+        self._maybe_cleanup()
+        with self._lock:
+            entry = self._tasks.get(task_id)
+            if entry is None:
+                raise SharedTensorTaskError(f"Task '{task_id}' was not found")
+            future = entry.future
+        try:
+            future.result(timeout=timeout)
+        except FutureTimeoutError as exc:
+            raise SharedTensorTaskError(
+                f"Task '{task_id}' did not complete within {timeout} seconds"
+            ) from exc
+        return self.result_payload(task_id)
+
     def result_payload(self, task_id: str) -> dict[str, str | None]:
         info = self.get(task_id)
         if info.status == TaskStatus.CANCELLED:
@@ -196,6 +239,7 @@ class TaskManager:
         return {
             "encoding": info.result_encoding,
             "payload_hex": info.result_hex,
+            "object_id": info.metadata.get("object_id"),
         }
 
     def cancel(self, task_id: str) -> bool:
