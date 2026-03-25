@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 import socket
 
 import pytest
@@ -75,12 +76,14 @@ def test_server_decode_call_params_rejects_non_empty_control_payload() -> None:
     server = SharedTensorServer(SharedTensorProvider(execution_mode="server"))
 
     with pytest.raises(SharedTensorProtocolError, match="reserved for empty args/kwargs"):
+        args_payload = pickle.dumps((1,), protocol=pickle.HIGHEST_PROTOCOL)
+        kwargs_payload = pickle.dumps({}, protocol=pickle.HIGHEST_PROTOCOL)
         server._decode_call_params(
             {
                 "endpoint": "noop",
                 "encoding": CONTROL_ENCODING,
-                "args_bytes": b"not-empty",
-                "kwargs_bytes": b"still-not-empty",
+                "args_bytes": args_payload,
+                "kwargs_bytes": kwargs_payload,
             }
         )
 

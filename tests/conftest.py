@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 
@@ -13,14 +14,15 @@ from shared_tensor import SharedTensorClient, SharedTensorServer
 
 @pytest.fixture
 def running_server() -> Iterator:
-    servers: list[tuple[SharedTensorServer, str]] = []
+    servers: list[tuple[SharedTensorServer, str, threading.Thread]] = []
 
     def factory(provider, **kwargs):
         base_dir = tempfile.mkdtemp(prefix="shared-tensor-")
         base_path = os.path.join(base_dir, "runtime")
         provider.base_path = base_path
         server = SharedTensorServer(provider, **kwargs)
-        server.start(blocking=False)
+        thread = threading.Thread(target=server.start, kwargs={"blocking": True}, daemon=True)
+        thread.start()
         deadline = time.time() + 5
         while time.time() < deadline:
             try:
@@ -32,12 +34,12 @@ def running_server() -> Iterator:
                 time.sleep(0.01)
         else:
             raise TimeoutError(f"Timed out waiting for server socket {server.socket_path}")
-        servers.append((server, base_dir))
+        servers.append((server, base_dir, thread))
         return server
 
     yield factory
 
-    for server, base_dir in reversed(servers):
+    for server, base_dir, thread in reversed(servers):
         server.stop()
         try:
             os.rmdir(base_dir)
