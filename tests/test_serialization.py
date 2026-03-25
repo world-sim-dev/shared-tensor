@@ -6,19 +6,25 @@ import multiprocessing.reduction as mp_reduction
 import pytest
 
 from shared_tensor.errors import SharedTensorCapabilityError
+from shared_tensor.errors import SharedTensorConfigurationError
 from shared_tensor.utils import (
     CONTROL_ENCODING,
     SHARED_TENSOR_BASE_PORT_ENV,
     TORCH_ENCODING,
     _validate_call_payload,
+    _normalize_for_cache,
     build_cache_key,
     deserialize_payload,
     format_cache_key,
+    payload_uses_cuda,
+    resolve_device_index,
     resolve_runtime_port,
     resolve_server_base_port,
     serialize_call_payloads,
     serialize_empty_payload,
     serialize_payload,
+    validate_call_payload_for_transport,
+    validate_payload_for_transport,
 )
 
 torch = pytest.importorskip("torch")
@@ -85,9 +91,24 @@ def test_resolve_server_base_port_uses_new_env_name(monkeypatch: pytest.MonkeyPa
     assert resolve_server_base_port(2537) == 4567
 
 
+def test_resolve_server_base_port_rejects_invalid_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(SHARED_TENSOR_BASE_PORT_ENV, "bad")
+    with pytest.raises(SharedTensorConfigurationError, match="must be an integer"):
+        resolve_server_base_port(2537)
+
+
 def test_resolve_runtime_port_offsets_base_port(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("shared_tensor.utils.resolve_device_index", lambda device_index=None: 4)
     assert resolve_runtime_port(3000) == 3004
+
+
+def test_resolve_device_index_rejects_negative_value() -> None:
+    with pytest.raises(SharedTensorConfigurationError, match="must be >= 0"):
+        resolve_device_index(-1)
+
+
+def test_resolve_device_index_returns_explicit_value() -> None:
+    assert resolve_device_index(3) == 3
 
 
 def test_torch_forking_pickler_falls_back_to_stdlib(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -103,6 +124,46 @@ def test_validate_call_payload_allows_scalar_kwargs_with_cuda_tensors() -> None:
     if payload["tensor"] is None:
         pytest.skip("CUDA is not available")
     _validate_call_payload(payload, allow_dict_keys=True)
+
+
+def test_validate_payload_for_transport_rejects_non_string_dict_key() -> None:
+    value = torch.arange(1, dtype=torch.float32) if not torch.cuda.is_available() else torch.ones(1, device="cuda")
+    with pytest.raises(SharedTensorCapabilityError, match="Dictionary payload keys must be strings"):
+        validate_payload_for_transport({1: value}, allow_dict_keys=True)
+
+
+def test_validate_call_payload_for_transport_allows_scalars() -> None:
+    validate_call_payload_for_transport({"version": 3}, allow_dict_keys=True)
+
+
+def test_serialize_empty_payload_rejects_non_empty_values() -> None:
+    with pytest.raises(SharedTensorCapabilityError, match="Only empty args/kwargs"):
+        serialize_empty_payload((1,))
+
+
+def test_build_cache_key_requires_func_when_format_key_is_used() -> None:
+    with pytest.raises(SharedTensorConfigurationError, match="func is required"):
+        build_cache_key("op", (), {}, cache_format_key="fixed")
+
+
+def test_normalize_for_cache_supports_bytes_sets_and_repr_fallback() -> None:
+    class Token:
+        def __repr__(self) -> str:
+            return "Token()"
+
+    normalized = {
+        "bytes": _normalize_for_cache(b"ab"),
+        "set": _normalize_for_cache({2, 1}),
+        "obj": _normalize_for_cache(Token()),
+    }
+
+    assert normalized["bytes"] == {"__bytes__": "6162"}
+    assert normalized["set"] == [1, 2]
+    assert normalized["obj"] == {"__repr__": "Token()", "__type__": "Token"}
+
+
+def test_payload_uses_cuda_returns_false_for_plain_objects() -> None:
+    assert payload_uses_cuda({"value": 1, "items": ["x"]}) is False
 
 
 def _produce_cuda_payload(kind: str, payload_queue, release_queue) -> None:

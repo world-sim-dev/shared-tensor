@@ -119,6 +119,97 @@ def test_client_mode_wrapper_exposes_submit(monkeypatch: pytest.MonkeyPatch) -> 
     assert calls == [("load_model", (4,), {})]
 
 
+def test_provider_submit_rejects_local_and_server_modes() -> None:
+    local_provider = SharedTensorProvider(execution_mode="local")
+    server_provider = SharedTensorProvider(execution_mode="server")
+
+    with pytest.raises(RuntimeError, match="do not support task submission"):
+        local_provider.submit("missing")
+    with pytest.raises(RuntimeError, match="do not support task submission"):
+        server_provider.submit("missing")
+
+
+def test_provider_execute_wait_false_returns_task_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SharedTensorProvider(execution_mode="client")
+    monkeypatch.setattr(provider, "submit", lambda endpoint, *args, **kwargs: "task-1")
+
+    assert provider.execute("load", wait=False) == "task-1"
+
+
+def test_provider_execute_wait_true_uses_wait_for_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SharedTensorProvider(execution_mode="client")
+    monkeypatch.setattr(provider, "submit", lambda endpoint, *args, **kwargs: "task-1")
+    monkeypatch.setattr(provider, "wait_for_task", lambda task_id, timeout=None, callback=None: (task_id, timeout, callback))
+
+    assert provider.execute("load", wait=True, timeout=2) == ("task-1", 2, None)
+
+
+def test_provider_task_helpers_forward_to_async_client() -> None:
+    provider = SharedTensorProvider(execution_mode="client")
+
+    class FakeAsyncClient:
+        def get_task_status(self, task_id):
+            return {"status": task_id}
+
+        def get_task_result(self, task_id):
+            return {"result": task_id}
+
+        def wait_for_task(self, task_id, timeout=None, callback=None):
+            return (task_id, timeout, callback)
+
+        def cancel_task(self, task_id):
+            return task_id == "t1"
+
+        def list_tasks(self, status=None):
+            return {"status": status}
+
+        def close(self):
+            return None
+
+    provider._async_client = FakeAsyncClient()
+
+    assert provider.get_task_status("t1") == {"status": "t1"}
+    assert provider.get_task_result("t1") == {"result": "t1"}
+    assert provider.wait_for_task("t1", timeout=1) == ("t1", 1, None)
+    assert provider.cancel_task("t1") is True
+    assert provider.list_tasks(status="done") == {"status": "done"}
+
+
+def test_provider_close_closes_all_resources() -> None:
+    provider = SharedTensorProvider(execution_mode="client")
+    events: list[str] = []
+
+    class FakeClient:
+        def close(self):
+            events.append("client")
+
+    class FakeAsyncClient:
+        def close(self):
+            events.append("async")
+
+    class FakeServer:
+        def stop(self):
+            events.append("server")
+
+    provider._client = FakeClient()
+    provider._async_client = FakeAsyncClient()
+    provider._server = FakeServer()
+
+    provider.close()
+
+    assert events == ["client", "async", "server"]
+    assert provider._client is None
+    assert provider._async_client is None
+    assert provider._server is None
+
+
+def test_provider_get_endpoint_rejects_missing_endpoint() -> None:
+    provider = SharedTensorProvider(execution_mode="local")
+
+    with pytest.raises(SharedTensorProviderError, match="not registered"):
+        provider.get_endpoint("missing")
+
+
 def test_auto_mode_defaults_to_client(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
     monkeypatch.delenv("SHARED_TENSOR_ROLE", raising=False)
