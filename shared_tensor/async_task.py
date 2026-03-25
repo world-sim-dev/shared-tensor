@@ -176,6 +176,14 @@ class TaskManager:
             return copy.deepcopy(entry.info)
 
     def result(self, task_id: str) -> Any:
+        payload = self.result_payload(task_id)
+        encoding = payload["encoding"]
+        payload_hex = payload["payload_hex"]
+        if encoding is None or payload_hex is None:
+            return None
+        return deserialize_payload(encoding, payload_hex)
+
+    def result_payload(self, task_id: str) -> dict[str, str | None]:
         info = self.get(task_id)
         if info.status == TaskStatus.CANCELLED:
             raise SharedTensorTaskError(f"Task '{task_id}' was cancelled")
@@ -185,9 +193,10 @@ class TaskManager:
             raise SharedTensorTaskError(
                 f"Task '{task_id}' is not complete; current status is '{info.status.value}'"
             )
-        if info.result_encoding is None or info.result_hex is None:
-            return None
-        return deserialize_payload(info.result_encoding, info.result_hex)
+        return {
+            "encoding": info.result_encoding,
+            "payload_hex": info.result_hex,
+        }
 
     def cancel(self, task_id: str) -> bool:
         self._maybe_cleanup()

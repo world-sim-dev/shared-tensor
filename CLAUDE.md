@@ -2,54 +2,54 @@
 
 ## Mission
 
-Keep `shared_tensor` small, explicit, and production-maintainable.
+Keep `shared_tensor` narrow, explicit, and production-maintainable.
 
-The library exists to expose named PyTorch endpoints over a localhost-first RPC transport for same-host, same-GPU object sharing. Every change should make the runtime behavior easier to reason about, not more magical.
+This repository exists to move CUDA `torch.Tensor` and CUDA `torch.nn.Module` objects across processes on the same host and the same GPU using native PyTorch IPC semantics. Every change should make that path more reliable and easier to reason about.
 
-## Product Boundaries
+## Product Definition
 
-- Default deployment target is a trusted same-host internal environment.
-- Public-internet hardening is out of scope unless a future change adds explicit auth, rate limiting, payload validation, and a documented security model.
-- The public API is endpoint-oriented. Arbitrary remote imports and arbitrary code execution are forbidden.
+- `torch` is a hard dependency.
+- The only supported data plane is same-host, same-GPU CUDA IPC.
+- Public API is endpoint-oriented and explicitly registered.
+- Trusted internal environments are in scope. Public-internet hardening is out of scope.
 - Generic Python-object RPC is out of scope.
 
 ## Runtime Rules
 
-- `torch` is a hard dependency.
-- Register endpoints explicitly with `register()` or `@share()`.
-- Supported transport payloads are CUDA `torch.Tensor` and CUDA `torch.nn.Module` values, including tuple/list/dict containers used for args and kwargs.
-- Same-host CUDA transport is allowed only when PyTorch IPC supports it. Never fake GPU sharing by silently copying to CPU.
-- CPU tensors, CPU modules, and arbitrary Python objects must fail fast with a capability error.
-- Empty `args` and `kwargs` may use a tiny control encoding only for no-argument RPC calls.
-- Errors must be typed and actionable: configuration, protocol, serialization, capability, remote execution, and task lifecycle failures stay distinct.
+- Supported payloads are CUDA `torch.Tensor` and CUDA `torch.nn.Module`.
+- `args` and `kwargs` may contain only supported payloads, wrapped in `tuple`, `list`, or `dict[str, ...]`.
+- Empty `args` and `kwargs` may use the control encoding for no-argument calls only.
+- CPU tensors, CPU modules, plain Python values, and `mps` payloads must fail fast.
+- Never fake GPU sharing by copying to CPU.
+- Never auto-call `.cuda()` during transport.
+- Never deserialize CUDA IPC payloads in the wrong process just for convenience.
 
 ## API Principles
 
-- Prefer explicit endpoint names over import paths.
-- Prefer a small stable surface over broad compatibility shims.
-- Keep sync and async APIs aligned: `call` for direct execution, `submit/status/result/cancel` for tasks.
-- Compatibility helpers may exist, but new docs and tests must use the modern API.
+- Prefer explicit endpoint names over import-path execution.
+- Keep sync and async interfaces aligned.
+- Keep compatibility helpers small and secondary to the main API.
+- Remove design complexity instead of hiding it behind more configuration.
 
 ## Testing Standard
 
-- `pytest` is the single source of truth.
-- Unit tests cover endpoint registration, protocol handling, caching, serialization rules, and error mapping.
-- Integration tests cover real server/client behavior for sync and async flows.
-- GPU tests must be isolated with a `gpu` marker and skip cleanly when CUDA is unavailable.
-- Non-GPU tests should still verify control-path behavior such as empty-call RPC, endpoint discovery, caching, and task lifecycle semantics.
-- Examples should be smoke-testable and reflect supported behavior only.
+- `pytest` is the source of truth.
+- Non-GPU runs must cover protocol, provider, sync, async, and control-path behavior.
+- GPU runs must validate real cross-process CUDA IPC behavior.
+- GPU tests should skip cleanly when CUDA is unavailable.
+- Examples and docs must only show supported behavior.
 
-## Packaging And Tooling
+## Packaging
 
 - Python baseline is `3.10+`.
-- Keep dependency surface minimal.
-- Do not add repo-local scripts that duplicate package CLI behavior.
-- Version metadata must stay consistent between the package and `pyproject.toml`.
+- Keep runtime dependencies minimal.
+- Package version must stay aligned across code and metadata.
+- Release docs should describe the single supported production path, not speculative future modes.
 
-## Anti-Patterns To Reject
+## Reject These Changes
 
-- Dynamic `module:function` execution from untrusted client input
-- Environment-variable-driven hidden mode switches for core behavior
-- Silent device migration or automatic `.cuda()` calls in serialization
-- Generic pickle transport for non-empty RPC payloads
-- Example code or tests that depend on unsupported CPU payload transport
+- Dynamic arbitrary `module:function` execution from untrusted input
+- Generic pickle RPC for non-empty application payloads
+- Silent CPU fallback
+- Hidden runtime mode switches for core transport semantics
+- New non-CUDA transport layers added as side paths to the core product

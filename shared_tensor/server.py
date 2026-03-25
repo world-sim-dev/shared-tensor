@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import multiprocessing as mp
+import os
 import sys
-import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from multiprocessing.process import BaseProcess
 from socketserver import ThreadingMixIn
 from typing import Any
 
@@ -107,15 +109,17 @@ class SharedTensorServer:
         self.port = port
         self.max_request_bytes = max_request_bytes
         self.verbose_debug = verbose_debug
+        self.max_workers = max_workers
+        self.result_ttl = result_ttl
         self.server: ThreadedHTTPServer | None = None
-        self.server_thread: threading.Thread | None = None
+        self.server_process: BaseProcess | None = None
         self.running = False
         self.started_at: float | None = None
         self.stats = {
             "requests_processed": 0,
             "errors_encountered": 0,
         }
-        self._task_manager = TaskManager(max_workers=max_workers, result_ttl=result_ttl)
+        self._task_manager: TaskManager | None = None
         self._cache: dict[str, dict[str, str | None]] = {}
 
     def health_response(self) -> str:
@@ -151,18 +155,18 @@ class SharedTensorServer:
         if method == "submit":
             return self._handle_submit(params)
         if method == "get_task":
-            return self._task_manager.get(self._require_task_id(params)).to_dict()
+            return self._task_manager_instance().get(self._require_task_id(params)).to_dict()
         if method == "get_task_result":
-            return self._encode_result(self._task_manager.result(self._require_task_id(params)))
+            return self._task_manager_instance().result_payload(self._require_task_id(params))
         if method == "cancel_task":
             task_id = self._require_task_id(params)
-            return {"task_id": task_id, "cancelled": self._task_manager.cancel(task_id)}
+            return {"task_id": task_id, "cancelled": self._task_manager_instance().cancel(task_id)}
         if method == "list_tasks":
             status = params.get("status")
             status_enum = TaskStatus(status) if status else None
             return {
                 task_id: info.to_dict()
-                for task_id, info in self._task_manager.list(status=status_enum).items()
+                for task_id, info in self._task_manager_instance().list(status=status_enum).items()
             }
         raise SharedTensorProtocolError(f"Unknown JSON-RPC method '{method}'")
 
@@ -184,7 +188,7 @@ class SharedTensorServer:
     def _handle_submit(self, params: dict[str, Any]) -> dict[str, Any]:
         endpoint, args, kwargs = self._decode_call_params(params)
         definition = self.provider.get_endpoint(endpoint)
-        info = self._task_manager.submit(endpoint, definition.func, args, kwargs)
+        info = self._task_manager_instance().submit(endpoint, definition.func, args, kwargs)
         return info.to_dict()
 
     def _decode_call_params(self, params: dict[str, Any]) -> tuple[str, tuple[Any, ...], dict[str, Any]]:
@@ -216,6 +220,14 @@ class SharedTensorServer:
         encoding, payload = serialize_payload(value)
         return {"encoding": encoding, "payload_hex": payload.hex()}
 
+    def _task_manager_instance(self) -> TaskManager:
+        if self._task_manager is None:
+            self._task_manager = TaskManager(
+                max_workers=self.max_workers,
+                result_ttl=self.result_ttl,
+            )
+        return self._task_manager
+
     @staticmethod
     def _require_task_id(params: dict[str, Any]) -> str:
         task_id = params.get("task_id")
@@ -239,26 +251,65 @@ class SharedTensorServer:
     def start(self, blocking: bool = True) -> None:
         if self.running:
             raise SharedTensorConfigurationError("Server is already running")
+        if blocking:
+            self._serve_forever()
+            return
+        if os.name != "posix":
+            raise SharedTensorConfigurationError(
+                "Non-blocking shared_tensor servers require POSIX fork semantics"
+            )
+        ctx = mp.get_context("fork")
+        process = ctx.Process(target=self._serve_forever, name=f"shared-tensor-server:{self.port}")
+        process.start()
+        self.server_process = process
+        self.running = True
+        self.started_at = time.time()
+
+    def _serve_forever(self) -> None:
         self.server = ThreadedHTTPServer((self.host, self.port), SharedTensorRequestHandler)
         self.server.shared_tensor_server = self  # type: ignore[attr-defined]
         self.running = True
         self.started_at = time.time()
-        if blocking:
+        try:
             self.server.serve_forever()
+        finally:
+            self._shutdown_local_resources()
+
+    @staticmethod
+    def _configure_cuda_runtime() -> None:
+        try:
+            import torch
+        except ImportError:
             return
-        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.server_thread.start()
+        if not torch.cuda.is_available():
+            return
+        local_rank = int(os.getenv("LOCAL_RANK", os.getenv("RANK", "0")))
+        if 0 <= local_rank < torch.cuda.device_count():
+            torch.cuda.set_device(local_rank)
 
     def stop(self) -> None:
         if not self.running:
             return
+        if self.server_process is not None:
+            self.server_process.terminate()
+            self.server_process.join(timeout=5)
+            if self.server_process.is_alive():
+                self.server_process.kill()
+                self.server_process.join(timeout=5)
+            self.server_process = None
+            self.running = False
+            return
+        self._shutdown_local_resources()
+        self.running = False
+
+    def _shutdown_local_resources(self) -> None:
         if self.server is not None:
             self.server.shutdown()
             self.server.server_close()
-        if self.server_thread is not None and self.server_thread.is_alive():
-            self.server_thread.join(timeout=5)
-        self._task_manager.shutdown(wait=False)
-        self.running = False
+            self.server = None
+        if self._task_manager is not None:
+            self._task_manager.shutdown(wait=False)
+            self._task_manager = None
 
     def __enter__(self) -> SharedTensorServer:
         self.start(blocking=False)
@@ -304,7 +355,11 @@ def main() -> int:
     parser.add_argument("--provider", required=True, help="module:attribute for a provider/server or factory")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2537)
-    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
