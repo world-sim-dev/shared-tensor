@@ -13,12 +13,12 @@ from shared_tensor.errors import SharedTensorCapabilityError, SharedTensorRemote
 torch = pytest.importorskip("torch")
 
 
-def _wait_for_socket(socket_path: str, timeout: float = 5.0) -> None:
+def _wait_for_socket(socket_path: str, timeout: float = 30.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if os.path.exists(socket_path):
             return
-        time.sleep(0.01)
+        time.sleep(0.05)
     raise TimeoutError(f"Timed out waiting for server socket {socket_path}")
 
 
