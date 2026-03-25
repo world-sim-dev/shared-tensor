@@ -53,91 +53,11 @@ conda activate shared-tensor-dev
 pip install -e ".[dev,test]"
 ```
 
-## Mental Model
+## Example 1: Zero-Branch Auto Mode
 
-### 1. Zero-Branch Auto Mode
+See [examples/zero_branch_env.py](./examples/zero_branch_env.py).
 
-```text
-same code file
-
-Process A                               Process B
-SHARED_TENSOR_ROLE=server               SHARED_TENSOR_ROLE unset
-----------------------------------      ----------------------------------
-provider.share(...)                     provider.share(...)
-provider auto-starts localhost daemon   provider builds RPC wrappers
-shared fn executes locally              shared fn becomes client call
-
-load_model(...)                         load_model(...)
-  -> local function body                  -> JSON-RPC to localhost daemon
-  -> CUDA model on this GPU               -> receives CUDA IPC-backed object
-```
-
-### 2. Direct Endpoint
-
-```text
-Client process                Server process
-------------------------      ------------------------------
-call("scale_tensor", x) ---> decode args
-                              run function immediately
-                              encode CUDA result
-<-------------------------     return result
-
-Best for: fast tensor transforms
-Key property: no task lifecycle
-```
-
-### 3. Task Endpoint For Slow Construction
-
-```text
-Client process                Server process
-------------------------      ----------------------------------------
-submit("load_model") ----->  create task record
-                              run slow model load in task executor
-poll / wait_for_task(...)     keep task status/result
-<-------------------------     return final CUDA object or handle
-
-Best for: slow model init, warmup, large allocations
-Key property: sync call can still block on task completion, async submit is also available
-```
-
-### 4. Managed + Cache + Singleflight
-
-```text
-Client A                      Server                         Client B
-------------------------      ------------------------       ------------------------
-call("load_model", k) -----> cache miss                    call("load_model", k)
-                              build object once              -------------> same key in flight
-                              object_id = obj-123                         wait on same future
-<-------------------------     return handle(obj-123)       <------------- return handle(obj-123)
-
-release(obj-123) ---------->  refcount 2 -> 1
-release(obj-123) ------------------------------------------> refcount 1 -> 0 -> destroy
-
-Best for: reusable models
-Key property: one build, many handles, explicit release
-```
-
-### 5. Serialized Endpoint
-
-```text
-Request 1                     Server lock                    Request 2
-------------------------      ------------------------       ------------------------
-call("compact_memory") --->  acquire endpoint lock
-                              run endpoint
-                              release lock
-<-------------------------                                   waits
-                                                             acquire lock
-                                                             run endpoint
-                                                             release lock
-                                   <------------------------- return
-
-Best for: fragile GPU-heavy paths that must not overlap
-Key property: serialization is endpoint-wide, not just per cache key
-```
-
-## Zero-Branch Example
-
-One file:
+One file, two processes, no branch in user code:
 
 ```python
 import torch
@@ -189,6 +109,124 @@ Behavior:
 - no `SHARED_TENSOR_HOST` is used; transport is fixed to `127.0.0.1`
 - the final port is `SHARED_TENSOR_BASE_PORT + current_cuda_device_index`
 
+Why this works:
+
+```text
+same code file
+
+Process A                               Process B
+SHARED_TENSOR_ROLE=server               SHARED_TENSOR_ROLE unset
+----------------------------------      ----------------------------------
+provider.share(...)                     provider.share(...)
+provider auto-starts localhost daemon   provider builds RPC wrappers
+shared fn executes locally              shared fn becomes RPC call
+
+load_model(...)                         load_model(...)
+  -> local CUDA model                     -> JSON-RPC to localhost daemon
+identity(x)                              -> receives CUDA IPC-backed result
+  -> local tensor return
+```
+
+Use this mode when you want the cleanest operator experience: one script, one env var difference, server side stays local, client side becomes remote automatically.
+
+## Example 2: Fast Tensor Transform
+
+See [examples/model_service.py](./examples/model_service.py).
+
+```python
+@provider.share(execution="direct", cache=False)
+def scale_tensor(tensor: torch.Tensor, factor: torch.Tensor) -> torch.Tensor:
+    return tensor * factor
+```
+
+What happens on the wire:
+
+```text
+client tensor -> direct RPC -> server runs function immediately -> CUDA result back
+```
+
+Use this for cheap tensor math, lightweight preprocessing, and request-scoped outputs.
+
+Recommended combination:
+
+- `execution="direct"`
+- `cache=False`
+- `managed=False`
+- `concurrency="parallel"`
+
+## Example 3: Reusable Model Service
+
+See [examples/model_service.py](./examples/model_service.py).
+
+```python
+@provider.share(
+    execution="task",
+    managed=True,
+    concurrency="serialized",
+    cache_format_key="model:{input_dim}:{output_dim}",
+)
+def load_linear_model(input_dim: int = 16, output_dim: int = 4) -> torch.nn.Module:
+    ...
+```
+
+What happens when two clients ask for the same model key:
+
+```text
+Client A                      Server                         Client B
+------------------------      ------------------------       ------------------------
+call("load_model", k) -----> cache miss                    call("load_model", k)
+                              build object once              -------------> same key in flight
+                              object_id = obj-123                         wait on same future
+<-------------------------     return handle(obj-123)       <------------- return handle(obj-123)
+
+release(obj-123) ---------->  refcount 2 -> 1
+release(obj-123) ------------------------------------------> refcount 1 -> 0 -> destroy
+```
+
+Use this for big reusable models. The important mix is:
+
+- `execution="task"`
+- `managed=True`
+- `concurrency="serialized"`
+- `singleflight=True`
+- explicit `cache_format_key`
+
+`managed=True` gives explicit lifecycle control. `cache_format_key` turns the endpoint into a model registry. `singleflight=True` ensures duplicate in-flight loads collapse to one build.
+
+## Example 4: Fire-And-Poll Warmup
+
+This is the same task-backed endpoint style, but the caller chooses async use:
+
+```python
+task_id = load_model.submit(hidden_size=8192)
+model_handle = provider.wait_for_task(task_id)
+```
+
+Runtime shape:
+
+```text
+submit now -> task queue -> slow build on server -> poll later -> consume handle/result
+```
+
+Use this when the build is slow enough that the caller should not block immediately.
+
+## Example 5: Serialized Fragile Path
+
+```python
+@provider.share(execution="task", concurrency="serialized", cache=False, singleflight=False)
+def compact_memory(tensor: torch.Tensor) -> torch.Tensor:
+    ...
+```
+
+Execution model:
+
+```text
+request A -> lock -> run -> unlock
+request B -> wait -> lock -> run -> unlock
+```
+
+Use this for GPU-heavy paths that must not overlap with themselves.
+
 ## Endpoint Semantics
 
 Each endpoint is registered once and then supports two client-side call styles.
@@ -204,10 +242,10 @@ Endpoint options:
 
 - `execution="direct"`
   - sync calls run the function directly on the server
-  - best for fast tensor transforms
+  - use this for fast tensor transforms
 - `execution="task"`
   - sync calls still block, but they block on the task system
-  - async submit is the natural path for slow model construction
+  - use this for slow construction, warmup, and reusable model loading
 - `concurrency="parallel"`
   - multiple server executions may run at once
 - `concurrency="serialized"`
@@ -216,176 +254,20 @@ Endpoint options:
   - identical in-flight cache keys collapse to one execution
   - this is the recommended model-loading default
 
-## Common Scenarios
+## Scenario Map
 
-### 1. Fast Tensor Transform
-
-```text
-client tensor -> direct RPC -> server op -> CUDA result back
-```
-
-Use this for cheap operations such as clone, view-like transforms, elementwise scaling, or lightweight preprocessing.
-
-```python
-@provider.share(execution="direct", cache=False)
-def scale_tensor(tensor: torch.Tensor, factor: torch.Tensor) -> torch.Tensor:
-    return tensor * factor
-```
-
-Recommended combination:
-
-- `execution="direct"`
-- `cache=False`
-- `managed=False`
-- `concurrency="parallel"`
-
-Why:
-
-- direct execution has the lowest overhead
-- these calls are request-scoped, so caching is usually wrong
-- parallel execution is usually fine because the work is short-lived
-
-### 2. Slow Model Construction
-
-```text
-client call/submit -> task queue -> slow load/build on server -> managed handle/result
-```
-
-Use this for loading or building a CUDA model that may take hundreds of milliseconds or multiple seconds.
-
-```python
-@provider.share(
-    execution="task",
-    managed=True,
-    concurrency="serialized",
-    cache_format_key="model:{hidden_size}",
-)
-def load_model(hidden_size: int) -> torch.nn.Module:
-    return torch.nn.Linear(hidden_size, 2, device="cuda")
-```
-
-Recommended combination:
-
-- `execution="task"`
-- `managed=True`
-- `concurrency="serialized"`
-- `singleflight=True`
-- explicit `cache_format_key`
-
-Why:
-
-- task mode gives you both blocking sync calls and true async submission
-- managed handles let the client release the remote object explicitly
-- serialized execution avoids multiple concurrent heavy loads on one GPU
-- singleflight prevents duplicate in-flight construction for the same model key
-
-### 3. Reusable Shared Model Service
-
-```text
-many clients -> same cache key -> same cached object_id -> refcounted release
-```
-
-Use this when the model should be built once and reused by many client calls.
-
-```python
-@provider.share(
-    execution="task",
-    managed=True,
-    cache_format_key="model:{model_name}:{dtype}",
-)
-def load_model(model_name: str, dtype: str) -> torch.nn.Module:
-    ...
-```
-
-Recommended combination:
-
-- `cache=True`
-- `managed=True`
-- `singleflight=True`
-- explicit stable cache key
-
-Why:
-
-- caching makes the endpoint act like a model registry
-- managed handles keep explicit lifecycle control
-- stable cache keys prevent accidental duplication from argument shape changes
-
-### 4. Fire-and-Poll Background Warmup
-
-```text
-submit now -> task runs in background -> poll later -> consume handle/result
-```
-
-Use this when the caller should not block, for example prewarming a model or allocating a large reusable tensor in the background.
-
-```python
-task_id = load_model.submit(hidden_size=8192)
-model_handle = provider.wait_for_task(task_id)
-```
-
-Recommended combination:
-
-- endpoint uses `execution="task"`
-- caller uses `.submit(...)`
-- optionally add `managed=True` for long-lived objects
-
-Why:
-
-- the endpoint stays declarative
-- the caller decides whether to block now or poll later
-
-### 5. Strictly Non-Reusable Per-Request Work
-
-```text
-request A -> fresh object
-request B -> fresh object
-no cache, no reuse, no singleflight
-```
-
-Use this when every request must create a fresh result and reuse is wrong.
-
-```python
-@provider.share(execution="task", cache=False, singleflight=False)
-def build_request_tensor(template: torch.Tensor) -> torch.Tensor:
-    return template.clone()
-```
-
-Recommended combination:
-
-- `cache=False`
-- `singleflight=False`
-- choose `execution="direct"` or `execution="task"` based on runtime cost
-
-Why:
-
-- disabling cache avoids cross-request reuse
-- disabling singleflight ensures independent requests stay independent
-
-### 6. Endpoint That Must Run One At A Time
-
-```text
-request A -> lock -> run -> unlock
-request B -> wait -> lock -> run -> unlock
-```
-
-Use this when the endpoint mutates shared state, temporarily spikes memory, or must not overlap with itself.
-
-```python
-@provider.share(execution="task", concurrency="serialized", cache=False, singleflight=False)
-def compact_memory(tensor: torch.Tensor) -> torch.Tensor:
-    ...
-```
-
-Recommended combination:
-
-- `execution="task"`
-- `concurrency="serialized"`
-- usually `cache=False`
-
-Why:
-
-- serialization is endpoint-wide, not just per cache key
-- useful for fragile GPU-heavy paths where overlap is unsafe or wasteful
+- Fast tensor transform:
+  use `execution="direct"`, `cache=False`, `managed=False`
+- Slow model construction:
+  use `execution="task"`, `managed=True`, `concurrency="serialized"`
+- Reusable model registry:
+  add stable `cache_format_key` and keep `singleflight=True`
+- Background warmup:
+  keep endpoint as task-backed and use `.submit(...)`
+- Fragile non-overlapping GPU path:
+  use `concurrency="serialized"`
+- Fresh per-request work:
+  disable cache and usually disable singleflight
 
 ## Parameter Guide
 
