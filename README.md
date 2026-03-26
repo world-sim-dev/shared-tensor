@@ -12,7 +12,8 @@ Supported:
 - explicit endpoint registration
 - sync `call` and task-backed `submit`
 - managed object handles with explicit release
-- server-side caching, `cache_format_key`, and singleflight
+- server-side caching, `cache_format_key`, singleflight, and explicit cache invalidation
+- manual two-process deployment as the primary production path
 - zero-branch auto mode gated by `SHARED_TENSOR_ENABLED=1`
 
 Not supported:
@@ -53,6 +54,8 @@ Read the examples first, then the design notes:
 Production should prefer two explicitly started processes: one server process that owns CUDA objects, and one or more client processes that reopen them through torch IPC.
 
 See [examples/model_service.py](./examples/model_service.py) for endpoint definitions.
+
+The server-oriented example modules construct providers with explicit `execution_mode="server"` so importing the module already reflects the intended deployment role.
 
 Server process:
 
@@ -100,6 +103,7 @@ manages cache and refcounts         releases managed handles explicitly
 
 Core assumption:
 - the server process that owns the original CUDA allocation must stay alive while clients are still using reopened CUDA tensors or modules
+- handle health checks can detect some stale-object conditions, but they do not remove the producer-liveness requirement
 
 If the server exits, crashes, or is killed before the client is done with the shared CUDA object, behavior is no longer guaranteed by this library. Depending on PyTorch and CUDA runtime state, the client may see CUDA runtime errors, invalid resource handle failures, broken module execution, or process-level instability.
 
@@ -113,6 +117,11 @@ Treat producer liveness as a hard requirement, not a soft optimization.
 ## Example: Same Code, Two Processes
 
 See [examples/zero_branch_env.py](./examples/zero_branch_env.py). This is a convenience mode for environments that want one file and environment-controlled behavior.
+
+Resolution rule:
+- `SHARED_TENSOR_ENABLED` unset or false: provider stays local
+- `SHARED_TENSOR_ENABLED=1` and `SHARED_TENSOR_ROLE=server`: provider resolves to server and auto-starts the thread-backed local server
+- `SHARED_TENSOR_ENABLED=1` and role unset or `client`: provider resolves to client
 
 ```bash
 SHARED_TENSOR_ENABLED=1 SHARED_TENSOR_ROLE=server python demo.py
@@ -130,6 +139,27 @@ provider auto-starts local thread   provider builds client wrappers
 shared function runs locally        shared function becomes RPC call
 CUDA object stays on same GPU       CUDA object is reopened via torch IPC
 ```
+
+## Example: Task Submission And Wait
+
+See [examples/async_service.py](./examples/async_service.py).
+
+```python
+from shared_tensor import AsyncSharedTensorClient, SharedTensorProvider
+
+provider = SharedTensorProvider(execution_mode="server")
+
+@provider.share(execution="task")
+def build_delayed_model(delay: float = 0.1):
+    ...
+
+client = AsyncSharedTensorClient()
+task_id = client.submit("build_delayed_model", delay=0.1)
+model = client.wait_for_task(task_id, timeout=30)
+```
+
+Use `SharedTensorProvider(execution="task")` for task-backed endpoints.
+Use `AsyncSharedTensorClient` when you want a task-oriented waiting interface.
 
 ## Example: Reusable Model Registry
 
@@ -241,11 +271,47 @@ handle.release()
 ```
 
 Use managed mode for cached models or other reusable long-lived CUDA objects.
+Managed object introspection now includes `created_at` and `last_accessed_at` timestamps through `get_object_info()`.
+
+## Cache Invalidation
+
+The library now exposes explicit cache invalidation instead of forcing process restarts when a cached object becomes stale.
+
+```python
+provider.invalidate_call_cache("load_model", hidden_size=4096)
+provider.invalidate_endpoint_cache("load_model")
+```
+
+Client-side equivalents are also available:
+
+```python
+client.invalidate_call_cache("load_model", hidden_size=4096)
+client.invalidate_endpoint_cache("load_model")
+```
+
+Use call-level invalidation when you want to evict one cache key.
+Use endpoint-level invalidation when you want to drop all cached variants for the endpoint.
+Invalidation removes cache lookup entries; it does not guarantee that already-issued client handles remain valid after producer death.
+
+
+## Handle Health Checks
+
+Managed handles now carry the producer `server_id` and support lightweight liveness probes:
+
+```python
+handle = client.call("load_model", hidden_size=4096)
+info = handle.get_object_info()
+client.ensure_handle_live(handle)
+```
+
+If the producer no longer owns the object, `client.ensure_handle_live(handle)` raises `SharedTensorStaleHandleError`.
+This is still advisory, not a durability guarantee: it helps detect stale handles earlier, but it cannot make producer death safe.
 
 ## Runtime Introspection
 
-`client.get_server_info()` now returns readiness and process metadata in addition to endpoint and capability data.
+`client.get_server_info()` now returns readiness, stable `server_id`, cache/task counters, and process metadata in addition to endpoint and capability data.
 In client mode, `provider.get_runtime_info()` wraps that into a provider-oriented view.
+`AsyncSharedTensorClient` exposes the same runtime, cache invalidation, release, and handle-health helper methods as `SharedTensorClient`; the async surface is task-oriented, not capability-reduced.
 
 ```python
 info = provider.get_runtime_info()

@@ -6,8 +6,9 @@ import pytest
 
 from shared_tensor import (
     AsyncSharedTensorClient,
-    AsyncSharedTensorProvider,
     SharedObjectHandle,
+    SharedTensorProvider,
+    SharedTensorStaleHandleError,
 )
 from shared_tensor.async_task import TaskStatus
 from shared_tensor.errors import SharedTensorRemoteError, SharedTensorTaskError
@@ -25,9 +26,9 @@ def _client(server, **kwargs) -> AsyncSharedTensorClient:
 
 
 def test_async_submit_and_result_flow(running_server) -> None:
-    provider = AsyncSharedTensorProvider(execution_mode="server")
+    provider = SharedTensorProvider(execution_mode="server")
 
-    @provider.share(wait=False)
+    @provider.share(execution="task")
     def slow_noop() -> None:
         time.sleep(0.05)
         return None
@@ -43,9 +44,9 @@ def test_async_submit_and_result_flow(running_server) -> None:
 
 
 def test_async_cancel_pending_task(running_server) -> None:
-    provider = AsyncSharedTensorProvider(execution_mode="server")
+    provider = SharedTensorProvider(execution_mode="server")
 
-    @provider.share(wait=False, cache=False, singleflight=False)
+    @provider.share(execution="task", cache=False, singleflight=False)
     def slow_job() -> None:
         time.sleep(0.2)
         return None
@@ -64,9 +65,9 @@ def test_async_cancel_pending_task(running_server) -> None:
 
 
 def test_async_failed_task_surfaces_error(running_server) -> None:
-    provider = AsyncSharedTensorProvider(execution_mode="server")
+    provider = SharedTensorProvider(execution_mode="server")
 
-    @provider.share(wait=False)
+    @provider.share(execution="task")
     def explode() -> None:
         raise ValueError("boom")
 
@@ -82,9 +83,9 @@ def test_async_managed_result_returns_handle(running_server) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
-    provider = AsyncSharedTensorProvider(execution_mode="server")
+    provider = SharedTensorProvider(execution_mode="server")
 
-    @provider.share(managed=True, wait=False)
+    @provider.share(execution="task", managed=True)
     def build_tensor() -> torch.Tensor:
         return torch.arange(3, dtype=torch.float32, device="cuda")
 
@@ -98,68 +99,10 @@ def test_async_managed_result_returns_handle(running_server) -> None:
         assert handle.release() is True
 
 
-def test_async_provider_defaults_to_task_execution() -> None:
-    provider = AsyncSharedTensorProvider(execution_mode="local")
-
-    @provider.share
-    def build() -> None:
-        return None
-
-    metadata = provider.list_endpoints()["build"]
-    assert metadata["execution"] == "task"
-
-
-def test_async_provider_enabled_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SHARED_TENSOR_ENABLED", raising=False)
-    monkeypatch.delenv("SHARED_TENSOR_ROLE", raising=False)
-
-    provider = AsyncSharedTensorProvider(enabled=True)
-
-    assert provider.execution_mode == "client"
-    assert provider.auto_mode is True
-
-
-def test_async_provider_wait_true_uses_sync_call_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = AsyncSharedTensorProvider(execution_mode="client")
-    calls = []
-
-    def fake_call(endpoint, *args, **kwargs):
-        calls.append((endpoint, args, kwargs))
-        return "ok"
-
-    monkeypatch.setattr(provider, "call", fake_call)
-
-    @provider.share(wait=True)
-    def build(value: int) -> None:
-        return None
-
-    assert build(3) == "ok"
-    assert calls == [("build", (3,), {})]
-
-
-def test_async_provider_wait_false_uses_submit_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = AsyncSharedTensorProvider(execution_mode="client")
-    calls = []
-
-    def fake_submit(endpoint, *args, **kwargs):
-        calls.append((endpoint, args, kwargs))
-        return "task-123"
-
-    monkeypatch.setattr(provider, "submit", fake_submit)
-
-    @provider.share(wait=False)
-    def build(value: int) -> None:
-        return None
-
-    assert build(3) == "task-123"
-    assert build.submit_async(4) == "task-123"
-    assert calls == [("build", (3,), {}), ("build", (4,), {})]
-
-
 def test_async_cached_submit_reuses_server_result(running_server) -> None:
-    provider = AsyncSharedTensorProvider(execution_mode="server")
+    provider = SharedTensorProvider(execution_mode="server")
 
-    @provider.share(wait=False, managed=True, cache_format_key="fixed")
+    @provider.share(execution="task", managed=True, cache_format_key="fixed")
     def build_tensor(version: int) -> torch.Tensor:
         return torch.full((1,), float(version), device="cuda")
 
@@ -194,5 +137,55 @@ def test_async_client_wait_uses_structured_task_error_code() -> None:
     try:
         with pytest.raises(SharedTensorTaskError, match="boom"):
             client.wait_for_task("task-1", timeout=0.1)
+    finally:
+        client.close()
+
+
+def test_async_client_forwards_runtime_and_cache_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = AsyncSharedTensorClient(base_path="/tmp/shared-tensor-test", device_index=0)
+    handle = SharedObjectHandle(
+        object_id="obj-1",
+        value=object(),
+        _releaser=type("Releaser", (), {"release": lambda self: True, "get_object_info": lambda self: None})(),
+        server_id="srv-1",
+    )
+
+    monkeypatch.setattr(client._client, "ping", lambda: True)
+    monkeypatch.setattr(client._client, "get_server_info", lambda: {"server_id": "srv-1"})
+    monkeypatch.setattr(client._client, "list_endpoints", lambda: {"build": {"managed": True}})
+    monkeypatch.setattr(client._client, "release", lambda object_id: object_id == "obj-1")
+    monkeypatch.setattr(client._client, "release_many", lambda object_ids: {object_id: True for object_id in object_ids})
+    monkeypatch.setattr(client._client, "get_object_info", lambda object_id: {"object_id": object_id, "server_id": "srv-1"})
+    monkeypatch.setattr(client._client, "ensure_handle_live", lambda managed_handle, refresh=True: {"object_id": managed_handle.object_id, "refresh": refresh})
+    monkeypatch.setattr(client._client, "invalidate_call_cache", lambda endpoint, *args, **kwargs: endpoint == "build")
+    monkeypatch.setattr(client._client, "invalidate_endpoint_cache", lambda endpoint: 2 if endpoint == "build" else 0)
+
+    try:
+        assert client.ping() is True
+        assert client.get_server_info() == {"server_id": "srv-1"}
+        assert client.list_endpoints() == {"build": {"managed": True}}
+        assert client.release("obj-1") is True
+        assert client.release_many(["obj-1", "obj-2"]) == {"obj-1": True, "obj-2": True}
+        assert client.get_object_info("obj-1") == {"object_id": "obj-1", "server_id": "srv-1"}
+        assert client.ensure_handle_live(handle, refresh=False) == {"object_id": "obj-1", "refresh": False}
+        assert client.invalidate_call_cache("build") is True
+        assert client.invalidate_endpoint_cache("build") == 2
+    finally:
+        client.close()
+
+
+def test_async_client_preserves_stale_handle_error_details() -> None:
+    client = AsyncSharedTensorClient(base_path="/tmp/shared-tensor-test", device_index=0)
+    handle = SharedObjectHandle(
+        object_id="obj-1",
+        value=object(),
+        _releaser=type("Releaser", (), {"release": lambda self: True, "get_object_info": lambda self: None})(),
+        server_id="srv-1",
+    )
+    try:
+        with pytest.raises(SharedTensorStaleHandleError) as exc_info:
+            client.ensure_handle_live(handle)
+        assert exc_info.value.reason == "object_missing"
+        assert exc_info.value.object_id == "obj-1"
     finally:
         client.close()

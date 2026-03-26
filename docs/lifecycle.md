@@ -176,6 +176,8 @@ Current contract:
 - first successful release returns `True`
 - releasing an already released local handle returns `False`
 - releasing an unknown object id on the server is a no-op with `released=False`
+- cache invalidation removes future lookup reuse, but does not revoke already-issued handles
+- `handle.get_object_info()` and `client.ensure_handle_live(handle)` are advisory freshness checks, not ownership transfer
 
 ## 7. Failure-Prone Edges
 
@@ -186,5 +188,22 @@ These are the lifecycle edges most likely to cause bugs:
 - coupling task retention to managed object retention
 - clearing server-owned cache before handles are released
 - using overly broad `cache_format_key` values and accidentally aliasing distinct resources
+- assuming cache invalidation is the same as force-destroying already shared managed objects
 
 Those are the edges the current test suite should continue to guard.
+
+
+## 8. Observability And Runtime Identity
+
+Every server instance now exposes a stable `server_id` for its lifetime.
+`get_server_info()` also reports:
+
+- cache hit and miss counters
+- task submission counts
+- cache invalidation counts
+- current cache entry count
+- managed object count and cached managed-object count
+- task count
+
+This is still lightweight observability, not a full metrics backend, but it makes cache behavior and stale-server debugging much less opaque.
+Managed object info now also includes the current `server_id`, which lets clients detect simple stale-handle and server-restart mismatches earlier.

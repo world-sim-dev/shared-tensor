@@ -7,6 +7,7 @@ import socket
 from dataclasses import dataclass
 from typing import Any, cast
 
+from shared_tensor.async_task import TaskStatus
 from shared_tensor.errors import (
     SharedTensorCapabilityError,
     SharedTensorClientError,
@@ -16,19 +17,18 @@ from shared_tensor.errors import (
     SharedTensorProtocolError,
     SharedTensorRemoteError,
     SharedTensorSerializationError,
+    SharedTensorStaleHandleError,
     SharedTensorTaskError,
 )
 from shared_tensor.managed_object import ReleaseHandle, SharedObjectHandle
 from shared_tensor.runtime import get_local_server
 from shared_tensor.transport import recv_message, send_message
-from shared_tensor.async_task import TaskStatus
 from shared_tensor.utils import (
     deserialize_payload,
     resolve_runtime_socket_path,
     serialize_call_payloads,
     validate_payload_for_transport,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,9 @@ class _ClientReleaser(ReleaseHandle):
 
     def release(self) -> bool:
         return self.client.release(self.object_id)
+
+    def get_object_info(self) -> dict[str, Any] | None:
+        return self.client.get_object_info(self.object_id)
 
 
 class SharedTensorClient:
@@ -76,6 +79,8 @@ class SharedTensorClient:
             code = 5
         elif isinstance(exc, SharedTensorConfigurationError):
             code = 6
+        elif isinstance(exc, SharedTensorStaleHandleError):
+            code = 8
         else:
             code = 7
         return SharedTensorRemoteError(
@@ -105,6 +110,7 @@ class SharedTensorClient:
             object_id=cast(str, object_id),
             value=value,
             _releaser=_ClientReleaser(client=self, object_id=cast(str, object_id)),
+            server_id=self._infer_server_id(),
         )
 
     def _send_request(self, request: dict[str, Any]) -> Any:
@@ -157,6 +163,15 @@ class SharedTensorClient:
 
     def _request(self, method: str, params: dict[str, Any] | None = None) -> Any:
         return self._send_request({"method": method, "params": params or {}})
+
+    def _infer_server_id(self) -> str | None:
+        local_server = self._local_server()
+        if local_server is not None:
+            return cast(str | None, getattr(local_server, "server_id", None))
+        try:
+            return cast(str | None, self.get_server_info().get("server_id"))
+        except (SharedTensorClientError, SharedTensorRemoteError, SharedTensorProtocolError):
+            return None
 
     def call(self, endpoint: str, *args: Any, **kwargs: Any) -> Any:
         if self.verbose_debug:
@@ -245,6 +260,25 @@ class SharedTensorClient:
         result = self._request("get_object_info", {"object_id": object_id})
         return cast(dict[str, Any] | None, result.get("object"))
 
+    def ensure_handle_live(self, handle: SharedObjectHandle[Any], *, refresh: bool = True) -> dict[str, Any]:
+        info = handle.get_object_info(refresh=refresh)
+        if info is None:
+            raise SharedTensorStaleHandleError(
+                f"Managed object '{handle.object_id}' is no longer registered on the producer",
+                object_id=handle.object_id,
+                server_id=handle.server_id,
+                reason="object_missing",
+            )
+        observed_server_id = cast(str | None, info.get("server_id"))
+        if handle.server_id is not None and observed_server_id is not None and observed_server_id != handle.server_id:
+            raise SharedTensorStaleHandleError(
+                f"Managed object '{handle.object_id}' belongs to server '{handle.server_id}' but producer now reports '{observed_server_id}'",
+                object_id=handle.object_id,
+                server_id=handle.server_id,
+                reason="server_mismatch",
+            )
+        return info
+
     def ping(self) -> bool:
         if self._local_server() is not None:
             return True
@@ -259,6 +293,31 @@ class SharedTensorClient:
         if local_server is not None:
             return self._run_local(lambda: cast(dict[str, Any], local_server._get_server_info()))
         return cast(dict[str, Any], self._request("get_server_info"))
+
+    def invalidate_call_cache(self, endpoint: str, *args: Any, **kwargs: Any) -> bool:
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(
+                lambda: bool(local_server.invalidate_call_cache(endpoint, args=tuple(args), kwargs=dict(kwargs)))
+            )
+        encoding, args_payload, kwargs_payload = serialize_call_payloads(tuple(args), dict(kwargs))
+        result = self._request(
+            "invalidate_call_cache",
+            {
+                "endpoint": endpoint,
+                "args_bytes": args_payload,
+                "kwargs_bytes": kwargs_payload,
+                "encoding": encoding,
+            },
+        )
+        return bool(result["invalidated"])
+
+    def invalidate_endpoint_cache(self, endpoint: str) -> int:
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(lambda: int(local_server.invalidate_endpoint_cache(endpoint)))
+        result = self._request("invalidate_endpoint_cache", {"endpoint": endpoint})
+        return int(result["invalidated"])
 
     def list_endpoints(self) -> dict[str, Any]:
         local_server = self._local_server()
@@ -344,4 +403,5 @@ class SharedTensorClient:
             object_id=cast(str, object_id),
             value=value,
             _releaser=_ClientReleaser(client=self, object_id=cast(str, object_id)),
+            server_id=cast(str | None, result.get("server_id")),
         )

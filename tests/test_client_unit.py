@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared_tensor import SharedObjectHandle, SharedTensorClient
+from shared_tensor import SharedObjectHandle, SharedTensorClient, SharedTensorStaleHandleError
 from shared_tensor.errors import (
     SharedTensorCapabilityError,
     SharedTensorClientError,
@@ -40,10 +40,12 @@ def test_client_decode_rpc_payload_wraps_managed_result() -> None:
                 "encoding": CONTROL_ENCODING,
                 "payload_bytes": payload,
                 "object_id": "obj-123",
+                "server_id": "srv-1",
             }
         )
         assert isinstance(result, SharedObjectHandle)
         assert result.object_id == "obj-123"
+        assert result.server_id == "srv-1"
         assert result.value == ()
     finally:
         client.close()
@@ -182,15 +184,19 @@ def test_client_release_related_helpers_forward_results(monkeypatch: pytest.Monk
         responses = {
             "release_object": {"released": True},
             "release_objects": {"released": {"a": True, "b": False}},
-            "get_object_info": {"object": {"object_id": "a"}},
-            "get_server_info": {"server": "SharedTensorServer"},
+            "get_object_info": {"object": {"object_id": "a", "server_id": "srv-1"}},
+            "get_server_info": {"server": "SharedTensorServer", "server_id": "srv-1"},
+            "invalidate_call_cache": {"invalidated": True},
+            "invalidate_endpoint_cache": {"invalidated": 2},
             "list_endpoints": {"load_model": {"managed": True}},
         }
         monkeypatch.setattr(client, "_request", lambda method, params=None: responses[method])
         assert client.release("a") is True
         assert client.release_many(["a", "b"]) == {"a": True, "b": False}
-        assert client.get_object_info("a") == {"object_id": "a"}
-        assert client.get_server_info() == {"server": "SharedTensorServer"}
+        assert client.get_object_info("a") == {"object_id": "a", "server_id": "srv-1"}
+        assert client.get_server_info() == {"server": "SharedTensorServer", "server_id": "srv-1"}
+        assert client.invalidate_call_cache("load_model") is True
+        assert client.invalidate_endpoint_cache("load_model") == 2
         assert client.list_endpoints() == {"load_model": {"managed": True}}
     finally:
         client.close()
@@ -209,12 +215,14 @@ def test_client_decode_local_result_wraps_managed_value_without_serializing(monk
     client = SharedTensorClient(device_index=0)
     token = object()
     monkeypatch.setattr("shared_tensor.client.validate_payload_for_transport", lambda value, allow_dict_keys=False: None)
+    monkeypatch.setattr(client, "_infer_server_id", lambda: "srv-local")
     try:
         result = client._decode_local_result(
             type("LocalResult", (), {"value": token, "object_id": "obj-1"})()
         )
         assert isinstance(result, SharedObjectHandle)
         assert result.object_id == "obj-1"
+        assert result.server_id == "srv-local"
         assert result.value is token
     finally:
         client.close()
@@ -227,3 +235,58 @@ def test_client_decode_local_result_rejects_unsupported_payload() -> None:
             client._decode_local_result(type("LocalResult", (), {"value": 1, "object_id": None})())
     finally:
         client.close()
+
+
+def test_client_ensure_handle_live_raises_stale_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = SharedTensorClient(device_index=0)
+    handle = SharedObjectHandle(
+        object_id="obj-1",
+        value=object(),
+        _releaser=type("Releaser", (), {"release": lambda self: True, "get_object_info": lambda self: None})(),
+        server_id="srv-1",
+    )
+    try:
+        with pytest.raises(SharedTensorStaleHandleError) as exc_info:
+            client.ensure_handle_live(handle)
+        assert exc_info.value.reason == "object_missing"
+        assert exc_info.value.object_id == "obj-1"
+    finally:
+        client.close()
+
+
+def test_client_ensure_handle_live_raises_on_server_mismatch() -> None:
+    client = SharedTensorClient(device_index=0)
+    handle = SharedObjectHandle(
+        object_id="obj-1",
+        value=object(),
+        _releaser=type(
+            "Releaser",
+            (),
+            {
+                "release": lambda self: True,
+                "get_object_info": lambda self: {"object_id": "obj-1", "server_id": "srv-2"},
+            },
+        )(),
+        server_id="srv-1",
+    )
+    try:
+        with pytest.raises(SharedTensorStaleHandleError) as exc_info:
+            client.ensure_handle_live(handle)
+        assert exc_info.value.reason == "server_mismatch"
+        assert exc_info.value.server_id == "srv-1"
+    finally:
+        client.close()
+
+
+def test_client_remote_error_from_local_preserves_stale_handle_code() -> None:
+    error = SharedTensorClient._remote_error_from_local(
+        SharedTensorStaleHandleError(
+            "stale",
+            object_id="obj-1",
+            server_id="srv-1",
+            reason="object_missing",
+        )
+    )
+
+    assert error.code == 8
+    assert error.error_type == "SharedTensorStaleHandleError"

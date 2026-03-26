@@ -1,4 +1,4 @@
-"""Canonical asynchronous service definition for CUDA torch IPC."""
+"""Canonical task-oriented service definition for CUDA torch IPC."""
 
 from __future__ import annotations
 
@@ -6,9 +6,9 @@ import time
 
 import torch
 
-from shared_tensor import AsyncSharedTensorProvider
+from shared_tensor import SharedTensorProvider
 
-provider = AsyncSharedTensorProvider(poll_interval=0.05)
+provider = SharedTensorProvider(execution_mode="server")
 
 
 def _require_cuda() -> None:
@@ -16,7 +16,7 @@ def _require_cuda() -> None:
         raise RuntimeError("CUDA is required for this example")
 
 
-@provider.share(wait=False)
+@provider.share(execution="task")
 def build_delayed_model(delay: float = 0.1) -> torch.nn.Module:
     _require_cuda()
     time.sleep(delay)

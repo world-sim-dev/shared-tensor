@@ -179,8 +179,8 @@ def test_managed_endpoint_returns_handle_and_supports_release(running_server, cl
         handle = client.call("managed_tensor")
         assert isinstance(handle, SharedObjectHandle)
         assert handle.value.is_cuda
-        info = client.get_object_info(handle.object_id)
-        assert info is not None
+        assert handle.server_id == server.server_id
+        info = client.ensure_handle_live(handle)
         assert info["endpoint"] == "managed_tensor"
         assert info["refcount"] == 1
         assert handle.release() is True
@@ -441,3 +441,53 @@ def test_thread_backed_local_client_task_call_waits_for_completion(running_serve
         assert client.call("delayed_none") is None
 
     assert time.time() - started >= 0.04
+
+
+def test_sync_client_can_invalidate_server_cache(running_server, client_for_server) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    provider = SharedTensorProvider(execution_mode="server")
+    calls = {"value": 0}
+
+    @provider.share(cache_format_key="{version}")
+    def build(version: int) -> torch.Tensor:
+        calls["value"] += 1
+        return torch.full((1,), float(version), device="cuda")
+
+    server = running_server(provider)
+
+    with client_for_server(server) as client:
+        first = client.call("build", version=1)
+        assert client.invalidate_call_cache("build", version=1) is True
+        second = client.call("build", version=1)
+
+    assert calls["value"] == 2
+    assert first.data_ptr() != second.data_ptr()
+
+
+def test_sync_client_can_invalidate_managed_server_endpoint_cache(running_server, client_for_server) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    provider = SharedTensorProvider(execution_mode="server")
+    calls = {"value": 0}
+
+    @provider.share(managed=True, cache_format_key="{hidden_size}")
+    def build_model(hidden_size: int) -> torch.nn.Module:
+        calls["value"] += 1
+        return torch.nn.Linear(hidden_size, 2, device="cuda")
+
+    server = running_server(provider)
+
+    with client_for_server(server) as client:
+        first = client.call("build_model", hidden_size=4)
+        assert isinstance(first, SharedObjectHandle)
+        assert client.invalidate_endpoint_cache("build_model") == 1
+        second = client.call("build_model", hidden_size=4)
+        assert isinstance(second, SharedObjectHandle)
+        assert first.object_id != second.object_id
+        first.release()
+        second.release()
+
+    assert calls["value"] == 2

@@ -10,6 +10,7 @@ from typing import Any, cast
 from shared_tensor.async_task import TaskInfo, TaskStatus
 from shared_tensor.client import SharedTensorClient
 from shared_tensor.errors import SharedTensorRemoteError, SharedTensorTaskError
+from shared_tensor.managed_object import SharedObjectHandle
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,38 @@ class AsyncSharedTensorClient:
 
     def get_task_result(self, task_id: str) -> Any:
         return self.result(task_id)
+
+    def ping(self) -> bool:
+        return self._client.ping()
+
+    def get_server_info(self) -> dict[str, Any]:
+        return self._client.get_server_info()
+
+    def list_endpoints(self) -> dict[str, Any]:
+        return self._client.list_endpoints()
+
+    def release(self, object_id: str) -> bool:
+        return self._client.release(object_id)
+
+    def release_many(self, object_ids: list[str]) -> dict[str, bool]:
+        return self._client.release_many(object_ids)
+
+    def get_object_info(self, object_id: str) -> dict[str, Any] | None:
+        return self._client.get_object_info(object_id)
+
+    def ensure_handle_live(
+        self,
+        handle: SharedObjectHandle[Any],
+        *,
+        refresh: bool = True,
+    ) -> dict[str, Any]:
+        return self._client.ensure_handle_live(handle, refresh=refresh)
+
+    def invalidate_call_cache(self, endpoint: str, *args: Any, **kwargs: Any) -> bool:
+        return self._client.invalidate_call_cache(endpoint, *args, **kwargs)
+
+    def invalidate_endpoint_cache(self, endpoint: str) -> int:
+        return self._client.invalidate_endpoint_cache(endpoint)
 
     def wait(
         self,

@@ -6,7 +6,7 @@ import torch
 
 from shared_tensor import SharedTensorProvider
 
-provider = SharedTensorProvider()
+provider = SharedTensorProvider(execution_mode="server")
 
 
 def _require_cuda() -> None:

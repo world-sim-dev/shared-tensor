@@ -14,6 +14,7 @@ from shared_tensor.errors import (
     SharedTensorProtocolError,
     SharedTensorProviderError,
     SharedTensorSerializationError,
+    SharedTensorStaleHandleError,
     SharedTensorTaskError,
 )
 from shared_tensor.provider import SharedTensorProvider
@@ -110,7 +111,9 @@ def test_server_handle_object_info_and_release() -> None:
     server = SharedTensorServer(provider)
     entry = server._managed_objects.register(endpoint="load", value=object(), cache_key="k")
 
-    assert server._handle_get_object_info({"object_id": entry.object_id})["object"]["endpoint"] == "load"
+    info = server._handle_get_object_info({"object_id": entry.object_id})["object"]
+    assert info["endpoint"] == "load"
+    assert info["server_id"] == server.server_id
     assert server._handle_release_object({"object_id": entry.object_id}) == {
         "object_id": entry.object_id,
         "released": True,
@@ -146,6 +149,7 @@ def test_server_error_code_mapping() -> None:
     assert SharedTensorServer._error_code_for(SharedTensorCapabilityError("x"))
     assert SharedTensorServer._error_code_for(SharedTensorTaskError("x"))
     assert SharedTensorServer._error_code_for(SharedTensorConfigurationError("x"))
+    assert SharedTensorServer._error_code_for(SharedTensorStaleHandleError("x")) == 8
     assert SharedTensorServer._error_code_for(RuntimeError("x"))
 
 
@@ -320,3 +324,57 @@ def test_server_stop_without_wait_rejects_new_requests() -> None:
 
     assert response["ok"] is False
     assert response["error"]["type"] == "SharedTensorConfigurationError"
+
+
+def test_server_invalidate_call_cache_removes_direct_entry() -> None:
+    provider = SharedTensorProvider(execution_mode="server")
+    server = SharedTensorServer(provider)
+    calls = {"value": 0}
+
+    @provider.share(cache_format_key="{value}")
+    def build(value: int):
+        calls["value"] += 1
+        return object()
+
+    first = server.invoke_local("build", args=(3,))
+    assert server.invalidate_call_cache("build", args=(3,)) is True
+    second = server.invoke_local("build", args=(3,))
+
+    assert calls["value"] == 2
+    assert first is not second
+
+
+def test_server_invalidate_endpoint_cache_removes_managed_cache_index() -> None:
+    provider = SharedTensorProvider(execution_mode="server")
+    server = SharedTensorServer(provider)
+    calls = {"value": 0}
+
+    @provider.share(managed=True, cache_format_key="{key}")
+    def build(key: str):
+        calls["value"] += 1
+        return object()
+
+    first = server.invoke_local("build", kwargs={"key": "a"})
+    assert server.invalidate_endpoint_cache("build") == 1
+    second = server.invoke_local("build", kwargs={"key": "a"})
+
+    assert calls["value"] == 2
+    assert first is not second
+
+
+def test_server_get_server_info_reports_cache_and_identity_metadata() -> None:
+    provider = SharedTensorProvider(execution_mode="server")
+    server = SharedTensorServer(provider)
+
+    @provider.share(cache_format_key="fixed")
+    def build():
+        return object()
+
+    server.invoke_local("build")
+    info = server._get_server_info()
+
+    assert isinstance(info["server_id"], str)
+    assert info["stats"]["cache_entries"] == 1
+    assert info["stats"]["cache_hits"] == 0
+    assert info["stats"]["cache_misses"] >= 1
+    assert info["stats"]["objects"] == 0

@@ -15,6 +15,7 @@ __all__ = [
     "SharedTensorClientError",
     "SharedTensorServerError",
     "SharedTensorProviderError",
+    "SharedTensorStaleHandleError",
 ]
 
 
@@ -69,3 +70,20 @@ class SharedTensorServerError(SharedTensorError):
 
 class SharedTensorProviderError(SharedTensorError):
     """Raised for provider registration or invocation problems."""
+
+
+class SharedTensorStaleHandleError(SharedTensorError):
+    """Raised when a managed handle can no longer be trusted."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        object_id: str | None = None,
+        server_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.object_id = object_id
+        self.server_id = server_id
+        self.reason = reason

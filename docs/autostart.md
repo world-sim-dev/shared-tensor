@@ -57,9 +57,13 @@ The same applies to:
 - `submit`
 - `get_task_result`
 - `wait_task`
+- `invalidate_call_cache`
+- `invalidate_endpoint_cache`
 - `release_object`
 - `release_objects`
 - `get_object_info`
+- `get_server_info`
+- `list_endpoints`
 - `list_tasks`
 
 ## Why Encode/Decode Is Wrong Here

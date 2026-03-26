@@ -506,6 +506,8 @@ def test_provider_get_runtime_info_local_mode() -> None:
         "device_index": None,
         "server_socket_path": "/tmp/runtime-info-0.sock",
         "server_running": False,
+        "endpoint_count": 0,
+        "cache_entries": 0,
     }
 
 
@@ -529,6 +531,8 @@ def test_provider_get_runtime_info_server_mode_reports_running_server() -> None:
         "device_index": None,
         "server_socket_path": "/tmp/runtime-info-0.sock",
         "server_running": True,
+        "endpoint_count": 0,
+        "cache_entries": 0,
     }
 
 
@@ -554,3 +558,37 @@ def test_provider_get_runtime_info_client_mode_uses_server_info() -> None:
     assert info["server_socket_path"] == "/tmp/runtime-info-0.sock"
     assert info["server_running"] is True
     assert info["server_ready"] is True
+
+
+def test_provider_invalidate_local_call_cache() -> None:
+    provider = SharedTensorProvider(execution_mode="local")
+    calls = {"value": 0}
+
+    @provider.share(cache_format_key="{version}")
+    def build(version: int) -> int:
+        calls["value"] += 1
+        return version
+
+    assert build(1) == 1
+    assert build(1) == 1
+    assert provider.invalidate_call_cache("build", version=1) is True
+    assert provider.invalidate_call_cache("build", version=1) is False
+    assert build(1) == 1
+    assert calls["value"] == 2
+
+
+def test_provider_invalidate_local_endpoint_cache() -> None:
+    provider = SharedTensorProvider(execution_mode="local")
+    calls = {"value": 0}
+
+    @provider.share(cache_format_key="{version}")
+    def build(version: int) -> int:
+        calls["value"] += 1
+        return version
+
+    assert build(1) == 1
+    assert build(2) == 2
+    assert provider.invalidate_endpoint_cache("build") == 2
+    assert build(1) == 1
+    assert build(2) == 2
+    assert calls["value"] == 4

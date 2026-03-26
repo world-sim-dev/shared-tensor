@@ -55,6 +55,23 @@ return original in-process object
 
 No UDS round trip.
 No CUDA IPC reopen.
+
+### Zero-Branch Env Resolution
+
+```text
+same Python file
+      |
+      v
+SHARED_TENSOR_ENABLED unset/false? ---- yes ---> provider resolves to local
+      |
+      no
+      v
+SHARED_TENSOR_ROLE=server? ---------- yes ---> provider resolves to server
+      |
+      no
+      v
+provider resolves to client
+```
 ```
 
 ## Server Materialization Policy

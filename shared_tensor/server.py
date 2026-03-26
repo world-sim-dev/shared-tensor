@@ -7,6 +7,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any
@@ -18,6 +19,7 @@ from shared_tensor.errors import (
     SharedTensorProtocolError,
     SharedTensorProviderError,
     SharedTensorSerializationError,
+    SharedTensorStaleHandleError,
     SharedTensorTaskError,
 )
 from shared_tensor.managed_object import ManagedObjectRegistry
@@ -110,6 +112,7 @@ class SharedTensorServer:
         self.startup_timeout = startup_timeout
         self.listener: socket.socket | None = None
         self.server_process: Any | None = None
+        self.server_id = uuid.uuid4().hex
         self.server_thread: _ServerThreadState | None = None
         self._resolved_process_start_method: str | None = None
         self.running = False
@@ -117,9 +120,13 @@ class SharedTensorServer:
         self.stats = {
             "requests_processed": 0,
             "errors_encountered": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "task_submissions": 0,
+            "cache_invalidations": 0,
         }
         self._task_manager: TaskManager | None = None
-        self._cache: dict[str, dict[str, Any]] = {}
+        self._cache: dict[str, str] = {}
         self._local_cache: dict[str, Any] = {}
         self._managed_objects = ManagedObjectRegistry()
         self._inflight: dict[str, _InFlightCall] = {}
@@ -182,6 +189,10 @@ class SharedTensorServer:
             return self._handle_release_objects(params)
         if method == "get_object_info":
             return self._handle_get_object_info(params)
+        if method == "invalidate_call_cache":
+            return self._handle_invalidate_call_cache(params)
+        if method == "invalidate_endpoint_cache":
+            return self._handle_invalidate_endpoint_cache(params)
         raise SharedTensorProtocolError(f"Unknown RPC method '{method}'")
 
     def _handle_call(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -224,6 +235,7 @@ class SharedTensorServer:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
+        self.stats["task_submissions"] += 1
         return self._task_manager_instance().submit(
             endpoint,
             self._execute_endpoint_result,
@@ -243,9 +255,11 @@ class SharedTensorServer:
         if cache_key is not None:
             cached = self._lookup_cached_result_value(definition, cache_key)
             if cached is not None:
+                self.stats["cache_hits"] += 1
                 if self.verbose_debug:
                     logger.debug("Server cache hit", extra={"endpoint": endpoint, "cache_key": cache_key})
                 return cached
+            self.stats["cache_misses"] += 1
 
         inflight_key = cache_key if cache_key is not None and definition.singleflight else None
         if inflight_key is not None:
@@ -317,6 +331,7 @@ class SharedTensorServer:
         if cache_key is not None:
             with self._coordination_lock:
                 self._local_cache[cache_key] = value
+                self._cache[cache_key] = endpoint
         return _EndpointResult(value=value)
 
     def _materialize_managed_result(
@@ -337,6 +352,9 @@ class SharedTensorServer:
         if self.verbose_debug:
             logger.debug("Server created managed object", extra={"endpoint": endpoint, "cache_key": cache_key})
         entry = self._managed_objects.register(endpoint=endpoint, value=result, cache_key=cache_key)
+        if cache_key is not None:
+            with self._coordination_lock:
+                self._cache[cache_key] = endpoint
         return _EndpointResult(value=entry.value, object_id=entry.object_id)
 
     def _lookup_cached_result_value(
@@ -353,9 +371,9 @@ class SharedTensorServer:
             self._managed_objects.add_ref(cached.object_id)
             return _EndpointResult(value=cached.value, object_id=cached.object_id)
         with self._coordination_lock:
-            local_value = self._local_cache.get(cache_key)
-        if local_value is None:
-            return None
+            if cache_key not in self._local_cache:
+                return None
+            local_value = self._local_cache[cache_key]
         return _EndpointResult(value=local_value)
 
     def call_local_client(
@@ -413,22 +431,30 @@ class SharedTensorServer:
             if cache_key is not None:
                 cached = self._managed_objects.get_cached(cache_key)
                 if cached is not None:
+                    self.stats["cache_hits"] += 1
                     return cached.value
+                self.stats["cache_misses"] += 1
             value = definition.func(*args, **resolved_kwargs)
             if cache_key is not None:
                 existing = self._managed_objects.get_cached(cache_key)
                 if existing is not None:
+                    self.stats["cache_hits"] += 1
                     return existing.value
                 self._managed_objects.register(endpoint=endpoint, value=value, cache_key=cache_key)
+                with self._coordination_lock:
+                    self._cache[cache_key] = endpoint
             return value
         if cache_key is not None:
             with self._coordination_lock:
                 if cache_key in self._local_cache:
+                    self.stats["cache_hits"] += 1
                     return self._local_cache[cache_key]
+            self.stats["cache_misses"] += 1
         value = definition.func(*args, **resolved_kwargs)
         if cache_key is not None:
             with self._coordination_lock:
                 self._local_cache[cache_key] = value
+                self._cache[cache_key] = endpoint
         return value
 
     def _cache_key(
@@ -498,7 +524,21 @@ class SharedTensorServer:
 
     def _handle_get_object_info(self, params: dict[str, Any]) -> dict[str, Any]:
         object_id = self._require_object_id(params)
-        return {"object": self._managed_objects.info(object_id)}
+        info = self._managed_objects.info(object_id)
+        if info is None:
+            return {"object": None}
+        return {"object": {**info, "server_id": self.server_id}}
+
+    def _handle_invalidate_call_cache(self, params: dict[str, Any]) -> dict[str, Any]:
+        endpoint, args, kwargs = self._decode_call_params(params)
+        removed = self.invalidate_call_cache(endpoint, args=args, kwargs=kwargs)
+        return {"invalidated": removed}
+
+    def _handle_invalidate_endpoint_cache(self, params: dict[str, Any]) -> dict[str, Any]:
+        endpoint = params.get("endpoint")
+        if not isinstance(endpoint, str) or not endpoint:
+            raise SharedTensorProtocolError("Missing required parameter 'endpoint'")
+        return {"invalidated": self.invalidate_endpoint_cache(endpoint)}
 
     def _decode_call_params(self, params: dict[str, Any]) -> tuple[str, tuple[Any, ...], dict[str, Any]]:
         endpoint = params.get("endpoint")
@@ -523,14 +563,34 @@ class SharedTensorServer:
         validate_call_payload_for_transport(kwargs, allow_dict_keys=True)
         return endpoint, args, kwargs
 
-    def _encode_result(self, value: Any, *, object_id: str | None = None) -> dict[str, Any]:
+    def _encode_result(
+        self,
+        value: Any,
+        *,
+        object_id: str | None = None,
+        server_id: str | None = None,
+    ) -> dict[str, Any]:
         if value is None:
-            return {"encoding": None, "payload_bytes": None, "object_id": object_id}
+            return {
+                "encoding": None,
+                "payload_bytes": None,
+                "object_id": object_id,
+                "server_id": server_id,
+            }
         encoding, payload = serialize_payload(value)
-        return {"encoding": encoding, "payload_bytes": payload, "object_id": object_id}
+        return {
+            "encoding": encoding,
+            "payload_bytes": payload,
+            "object_id": object_id,
+            "server_id": server_id,
+        }
 
     def _encode_endpoint_result(self, result: _EndpointResult) -> dict[str, Any]:
-        return self._encode_result(result.value, object_id=result.object_id)
+        return self._encode_result(
+            result.value,
+            object_id=result.object_id,
+            server_id=self.server_id if result.object_id is not None else None,
+        )
 
     def _task_manager_instance(self) -> TaskManager:
         if self._task_manager is None:
@@ -539,6 +599,44 @@ class SharedTensorServer:
                 result_ttl=self.result_ttl,
             )
         return self._task_manager
+
+    def invalidate_call_cache(
+        self,
+        endpoint: str,
+        *,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> bool:
+        definition = self.provider.get_endpoint(endpoint)
+        resolved_kwargs = kwargs or {}
+        cache_key = self._cache_key(endpoint, definition, args, resolved_kwargs)
+        if cache_key is None:
+            return False
+        invalidated_managed = False
+        if definition.managed:
+            invalidated_managed = self._managed_objects.invalidate_cache_key(cache_key)
+        with self._coordination_lock:
+            removed = self._local_cache.pop(cache_key, None)
+            self._cache.pop(cache_key, None)
+        invalidated = invalidated_managed or removed is not None
+        if invalidated:
+            self.stats["cache_invalidations"] += 1
+        return invalidated
+
+    def invalidate_endpoint_cache(self, endpoint: str) -> int:
+        self.provider.get_endpoint(endpoint)
+        removed = 0
+        with self._coordination_lock:
+            keys = [cache_key for cache_key, cache_endpoint in self._cache.items() if cache_endpoint == endpoint]
+            for cache_key in keys:
+                self._cache.pop(cache_key, None)
+                if cache_key in self._local_cache:
+                    self._local_cache.pop(cache_key, None)
+                    removed += 1
+        removed += self._managed_objects.invalidate_endpoint(endpoint)
+        if removed:
+            self.stats["cache_invalidations"] += removed
+        return removed
 
     @staticmethod
     def _require_task_id(params: dict[str, Any]) -> str:
@@ -559,6 +657,7 @@ class SharedTensorServer:
         return {
             "server": "SharedTensorServer",
             "version": _server_version(),
+            "server_id": self.server_id,
             "socket_path": self.socket_path,
             "uptime": uptime,
             "running": self.running,
@@ -567,7 +666,13 @@ class SharedTensorServer:
             "ppid": os.getppid(),
             "device_index": resolve_device_index(self.provider.device_index),
             "process_start_method": self._resolved_process_start_method,
-            "stats": dict(self.stats),
+            "stats": {
+                **dict(self.stats),
+                "cache_entries": len(self._local_cache),
+                "inflight_calls": len(self._inflight),
+                **self._managed_objects.stats(),
+                "task_count": 0 if self._task_manager is None else len(self._task_manager.list()),
+            },
             "capabilities": capability_snapshot(),
             "endpoints": list(self.provider.list_endpoints().keys()),
         }
@@ -737,4 +842,6 @@ class SharedTensorServer:
             return 5
         if isinstance(exc, SharedTensorConfigurationError):
             return 6
+        if isinstance(exc, SharedTensorStaleHandleError):
+            return 8
         return 7

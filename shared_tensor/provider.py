@@ -112,6 +112,7 @@ class SharedTensorProvider:
         self._async_client: Any | None = None
         self._server: Any | None = None
         self._cache: dict[str, Any] = {}
+        self._cache_key_index: dict[str, str] = {}
         self._endpoints: dict[str, EndpointDefinition] = {}
         self._registered_functions = self._endpoints
         self._lock = RLock()
@@ -263,6 +264,35 @@ class SharedTensorProvider:
     def list_tasks(self, status: str | None = None) -> dict[str, Any]:
         return self._get_async_client().list_tasks(status=status)
 
+    def invalidate_call_cache(self, endpoint: str, *args: Any, **kwargs: Any) -> bool:
+        if self.execution_mode == "server":
+            if self._server is not None and hasattr(self._server, "invalidate_call_cache"):
+                return bool(self._server.invalidate_call_cache(endpoint, args=args, kwargs=kwargs))
+            return False
+        if self.execution_mode == "local":
+            definition = self.get_endpoint(endpoint)
+            cache_key = self._cache_key_for(endpoint, definition, args, kwargs)
+            with self._lock:
+                removed = self._cache.pop(cache_key, None)
+                self._cache_key_index.pop(cache_key, None)
+            return removed is not None
+        return self._get_client().invalidate_call_cache(endpoint, *args, **kwargs)
+
+    def invalidate_endpoint_cache(self, endpoint: str) -> int:
+        if self.execution_mode == "server":
+            if self._server is not None and hasattr(self._server, "invalidate_endpoint_cache"):
+                return int(self._server.invalidate_endpoint_cache(endpoint))
+            return 0
+        if self.execution_mode == "local":
+            self.get_endpoint(endpoint)
+            with self._lock:
+                keys = [cache_key for cache_key, cache_endpoint in self._cache_key_index.items() if cache_endpoint == endpoint]
+                for cache_key in keys:
+                    self._cache.pop(cache_key, None)
+                    self._cache_key_index.pop(cache_key, None)
+            return len(keys)
+        return self._get_client().invalidate_endpoint_cache(endpoint)
+
     def invoke_local(
         self,
         endpoint: str,
@@ -283,6 +313,7 @@ class SharedTensorProvider:
         result = definition.func(*args, **resolved_kwargs)
         with self._lock:
             self._cache[cache_key] = result
+            self._cache_key_index[cache_key] = endpoint
         return result
 
     def get_endpoint(self, endpoint: str) -> EndpointDefinition:
@@ -328,6 +359,8 @@ class SharedTensorProvider:
                 "device_index": self.device_index,
                 "server_socket_path": resolve_runtime_socket_path(self.base_path, self.device_index),
                 "server_running": bool(server is not None and getattr(server, "running", True)),
+                "endpoint_count": len(self._endpoints),
+                "cache_entries": len(self._cache),
             }
         server_info = self._get_client().get_server_info()
         return {
@@ -338,6 +371,7 @@ class SharedTensorProvider:
             "server_socket_path": server_info.get("socket_path"),
             "server_running": bool(server_info.get("running")),
             "server_ready": bool(server_info.get("ready")),
+            "endpoint_count": len(self._endpoints),
             "server_info": server_info,
         }
 

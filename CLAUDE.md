@@ -28,6 +28,7 @@ This repository exists to move CUDA `torch.Tensor` and CUDA `torch.nn.Module` ob
 
 - Prefer explicit endpoint names over import-path execution.
 - Keep sync and async interfaces aligned.
+- Runtime introspection, cache invalidation, and managed-handle health helpers must not exist only on one client surface.
 - Automatic localhost server startup in provider auto mode is allowed.
 - Default result caching is part of the product contract.
 - `cache_format_key` must stay explicit, string-based, and easy to reason about.
@@ -44,7 +45,7 @@ This repository exists to move CUDA `torch.Tensor` and CUDA `torch.nn.Module` ob
 
 ## Packaging
 
-- Python baseline is `3.10+`.
+- Python baseline is `3.9+`.
 - Keep runtime dependencies minimal.
 - Package version must stay aligned across code and metadata.
 - Release docs should describe the single supported production path, not speculative future modes.

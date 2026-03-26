@@ -23,6 +23,8 @@ SharedTensorClient
 
 AsyncSharedTensorClient
     task-oriented facade over SharedTensorClient
+    preserves runtime introspection, cache invalidation,
+    and managed-handle lifecycle helpers from the sync client
 
 TaskManager
     in-process thread pool
