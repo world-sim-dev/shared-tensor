@@ -279,8 +279,8 @@ def test_auto_server_mode_calls_shared_function_locally(monkeypatch: pytest.Monk
         def start(self, blocking=False):
             events.append(f"start:{blocking}")
 
-        def stop(self):
-            events.append("stop")
+        def stop(self, wait_for_tasks=True):
+            events.append(f"stop:{wait_for_tasks}")
 
     monkeypatch.setattr("shared_tensor.server.SharedTensorServer", FakeServer)
 
@@ -294,7 +294,7 @@ def test_auto_server_mode_calls_shared_function_locally(monkeypatch: pytest.Monk
     assert events == ["init:/tmp/shared-tensor-auto-0.sock", "start:False"]
 
     provider.close()
-    assert events == ["init:/tmp/shared-tensor-auto-0.sock", "start:False", "stop"]
+    assert events == ["init:/tmp/shared-tensor-auto-0.sock", "start:False", "stop:True"]
 
 
 def test_client_uses_base_path_plus_device_index(monkeypatch: pytest.MonkeyPatch) -> None:

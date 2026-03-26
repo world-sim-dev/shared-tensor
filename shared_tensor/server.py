@@ -39,6 +39,24 @@ from shared_tensor.utils import (
 logger = logging.getLogger(__name__)
 
 
+class _ConnectionExecutor:
+    def __init__(self, *, max_workers: int) -> None:
+        self._semaphore = threading.BoundedSemaphore(max_workers)
+
+    def submit(self, func, *args, **kwargs) -> threading.Thread:
+        self._semaphore.acquire()
+
+        def runner() -> None:
+            try:
+                func(*args, **kwargs)
+            finally:
+                self._semaphore.release()
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        return thread
+
+
 def _server_version() -> str:
     try:
         from shared_tensor import __version__
@@ -49,7 +67,7 @@ def _server_version() -> str:
 
 @dataclass(slots=True)
 class _InFlightCall:
-    future: Future[dict[str, Any]]
+    future: Future
 
 
 @dataclass(slots=True)
@@ -107,6 +125,8 @@ class SharedTensorServer:
         self._inflight: dict[str, _InFlightCall] = {}
         self._endpoint_locks: dict[str, threading.Lock] = {}
         self._coordination_lock = threading.RLock()
+        self._connection_executor = _ConnectionExecutor(max_workers=max_workers)
+        self._accepting_requests = True
         if getattr(self.provider, "_server", None) is None:
             self.provider._server = self
 
@@ -114,6 +134,8 @@ class SharedTensorServer:
         if self.verbose_debug:
             logger.debug("Server processing request", extra={"method": request.get("method")})
         try:
+            if not self._accepting_requests:
+                raise SharedTensorConfigurationError("Server is stopping and not accepting new requests")
             method = request.get("method")
             if not isinstance(method, str) or not method:
                 raise SharedTensorProtocolError("Missing required field 'method'")
@@ -293,7 +315,8 @@ class SharedTensorServer:
         if self.verbose_debug:
             logger.debug("Server executed direct endpoint", extra={"endpoint": endpoint})
         if cache_key is not None:
-            self._local_cache[cache_key] = value
+            with self._coordination_lock:
+                self._local_cache[cache_key] = value
         return _EndpointResult(value=value)
 
     def _materialize_managed_result(
@@ -329,7 +352,8 @@ class SharedTensorServer:
                 return None
             self._managed_objects.add_ref(cached.object_id)
             return _EndpointResult(value=cached.value, object_id=cached.object_id)
-        local_value = self._local_cache.get(cache_key)
+        with self._coordination_lock:
+            local_value = self._local_cache.get(cache_key)
         if local_value is None:
             return None
         return _EndpointResult(value=local_value)
@@ -397,11 +421,14 @@ class SharedTensorServer:
                     return existing.value
                 self._managed_objects.register(endpoint=endpoint, value=value, cache_key=cache_key)
             return value
-        if cache_key is not None and cache_key in self._local_cache:
-            return self._local_cache[cache_key]
+        if cache_key is not None:
+            with self._coordination_lock:
+                if cache_key in self._local_cache:
+                    return self._local_cache[cache_key]
         value = definition.func(*args, **resolved_kwargs)
         if cache_key is not None:
-            self._local_cache[cache_key] = value
+            with self._coordination_lock:
+                self._local_cache[cache_key] = value
         return value
 
     def _cache_key(
@@ -421,16 +448,16 @@ class SharedTensorServer:
             cache_format_key=definition.cache_format_key,
         )
 
-    def _acquire_inflight(self, inflight_key: str) -> tuple[Future[dict[str, Any]], bool]:
+    def _acquire_inflight(self, inflight_key: str) -> tuple[Future, bool]:
         with self._coordination_lock:
             inflight = self._inflight.get(inflight_key)
             if inflight is not None:
                 return inflight.future, False
-            future: Future[dict[str, Any]] = Future()
+            future = Future()
             self._inflight[inflight_key] = _InFlightCall(future=future)
             return future, True
 
-    def _release_inflight(self, inflight_key: str | None, future: Future[dict[str, Any]]) -> None:
+    def _release_inflight(self, inflight_key: str | None, future: Future) -> None:
         if inflight_key is None:
             return
         with self._coordination_lock:
@@ -535,7 +562,7 @@ class SharedTensorServer:
             "socket_path": self.socket_path,
             "uptime": uptime,
             "running": self.running,
-            "ready": self.running and self.listener is not None,
+            "ready": self.running and self.listener is not None and self._accepting_requests,
             "pid": os.getpid(),
             "ppid": os.getppid(),
             "device_index": resolve_device_index(self.provider.device_index),
@@ -558,6 +585,7 @@ class SharedTensorServer:
             logger.info("Server starting", extra={"socket_path": self.socket_path, "blocking": blocking})
         if self.running or self.server_thread is not None:
             raise SharedTensorConfigurationError("Server is already running")
+        self._accepting_requests = True
         if blocking:
             self._resolved_process_start_method = None
             self._serve_forever()
@@ -576,11 +604,11 @@ class SharedTensorServer:
         self._resolved_process_start_method = "thread"
         thread.start()
         if not state.ready.wait(timeout=self.startup_timeout):
-            self.stop()
+            self.stop(wait_for_tasks=False)
             raise TimeoutError(f"Timed out waiting for server socket {self.socket_path}")
         if state.error is not None:
             error = state.error
-            self.stop()
+            self.stop(wait_for_tasks=False)
             raise SharedTensorConfigurationError(
                 f"Failed to start background server thread for {self.socket_path}: {error}"
             ) from error
@@ -620,12 +648,11 @@ class SharedTensorServer:
                     if self.running:
                         raise
                     break
-                thread = threading.Thread(target=self._handle_connection, args=(conn,), daemon=True)
-                thread.start()
+                self._connection_executor.submit(self._handle_connection, conn)
         finally:
             if started_event is not None and not started_event.is_set():
                 started_event.set()
-            self._shutdown_local_resources()
+            self._shutdown_local_resources(wait_for_tasks=True)
 
     def _handle_connection(self, conn: socket.socket) -> None:
         with conn:
@@ -655,9 +682,10 @@ class SharedTensorServer:
         if 0 <= local_rank < torch.cuda.device_count():
             torch.cuda.set_device(local_rank)
 
-    def stop(self) -> None:
+    def stop(self, *, wait_for_tasks: bool = True) -> None:
         if self.verbose_debug:
             logger.info("Server stopping", extra={"socket_path": self.socket_path})
+        self._accepting_requests = False
         self.running = False
         if self.listener is not None:
             self.listener.close()
@@ -668,21 +696,23 @@ class SharedTensorServer:
         self.server_thread = None
         self.server_process = None
         if self.listener is None:
-            unlink_socket_path(self.socket_path)
+            self._shutdown_local_resources(wait_for_tasks=wait_for_tasks)
 
-    def _shutdown_local_resources(self) -> None:
+    def _shutdown_local_resources(self, *, wait_for_tasks: bool) -> None:
+        self._accepting_requests = False
         self.running = False
         if self.listener is not None:
             self.listener.close()
             self.listener = None
         if self._task_manager is not None:
-            self._task_manager.shutdown(wait=False)
+            self._task_manager.shutdown(wait=wait_for_tasks, cancel_futures=not wait_for_tasks)
             self._task_manager = None
         self._managed_objects.clear()
-        self._cache.clear()
-        self._local_cache.clear()
-        self._inflight.clear()
-        self._endpoint_locks.clear()
+        with self._coordination_lock:
+            self._cache.clear()
+            self._local_cache.clear()
+            self._inflight.clear()
+            self._endpoint_locks.clear()
         unregister_local_server(self.socket_path, self)
         unlink_socket_path(self.socket_path)
 

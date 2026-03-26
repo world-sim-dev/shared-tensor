@@ -24,7 +24,9 @@ def test_task_manager_wait_result_payload_for_none_result() -> None:
         payload = manager.wait_result_payload(info.task_id, timeout=1)
 
         assert payload == {"encoding": None, "payload_bytes": None, "object_id": None}
-        assert manager.get(info.task_id).status == TaskStatus.COMPLETED
+        task = manager.get(info.task_id)
+        assert task.status == TaskStatus.COMPLETED
+        assert "result_payload" not in task.to_dict()
     finally:
         manager.shutdown(wait=True)
 
@@ -136,6 +138,13 @@ def test_task_manager_cancel_returns_false_for_completed_task() -> None:
         assert manager.cancel(info.task_id) is False
     finally:
         manager.shutdown(wait=True)
+
+
+def test_task_manager_shutdown_rejects_new_submissions() -> None:
+    manager = TaskManager(max_workers=1, cleanup_interval=0.0)
+    manager.shutdown(wait=True)
+    with pytest.raises(SharedTensorTaskError, match="not accepting new tasks"):
+        manager.submit("noop", lambda: None, (), {})
 
 
 def test_task_manager_respects_capacity_limit() -> None:

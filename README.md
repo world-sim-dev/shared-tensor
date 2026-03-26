@@ -25,7 +25,7 @@ Not supported:
 
 ## Install
 
-Use Python `3.10+` and a CUDA-enabled PyTorch build.
+Use Python `3.9+` and a CUDA-enabled PyTorch build.
 
 ```bash
 pip install shared-tensor

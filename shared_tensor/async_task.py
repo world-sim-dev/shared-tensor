@@ -33,8 +33,6 @@ class TaskInfo:
     created_at: float
     started_at: float | None = None
     completed_at: float | None = None
-    result_encoding: str | None = None
-    result_payload: bytes | None = None
     error_type: str | None = None
     error_message: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -47,8 +45,6 @@ class TaskInfo:
             "created_at": self.created_at,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
-            "result_encoding": self.result_encoding,
-            "result_payload": self.result_payload,
             "error_type": self.error_type,
             "error_message": self.error_message,
             "metadata": dict(self.metadata),
@@ -66,6 +62,8 @@ class TaskInfo:
 class _TaskEntry:
     info: TaskInfo
     future: Future[Any]
+    result_encoding: str | None = None
+    result_payload: bytes | None = None
     local_result: Any = None
 
 
@@ -87,6 +85,7 @@ class TaskManager:
         self._last_cleanup = 0.0
         self._lock = RLock()
         self._tasks: dict[str, _TaskEntry] = {}
+        self._accepting_submissions = True
 
     def submit(
         self,
@@ -98,6 +97,8 @@ class TaskManager:
     ) -> TaskInfo:
         self._maybe_cleanup()
         with self._lock:
+            if not self._accepting_submissions:
+                raise SharedTensorTaskError("Task manager is shutting down and is not accepting new tasks")
             self._drop_oldest_finished_tasks_if_needed()
             if len(self._tasks) >= self._max_tasks:
                 raise SharedTensorTaskError("Task capacity exceeded")
@@ -143,12 +144,11 @@ class TaskManager:
         self._store_local_result(task_id, result)
 
         if result is None:
+            self._store_payload(task_id, encoding=None, payload=None, object_id=None)
             self._transition(
                 task_id,
                 status=TaskStatus.COMPLETED,
                 completed_at=time.time(),
-                result_encoding=None,
-                result_payload=None,
             )
             return
 
@@ -168,13 +168,16 @@ class TaskManager:
             )
             return
 
+        self._store_payload(
+            task_id,
+            encoding=payload["encoding"],
+            payload=payload["payload_bytes"],
+            object_id=payload.get("object_id"),
+        )
         self._transition(
             task_id,
             status=TaskStatus.COMPLETED,
             completed_at=time.time(),
-            result_encoding=payload["encoding"],
-            result_payload=payload["payload_bytes"],
-            metadata={"object_id": payload.get("object_id")},
         )
 
     @staticmethod
@@ -200,6 +203,24 @@ class TaskManager:
             if entry is None:
                 return
             entry.local_result = value
+
+    def _store_payload(
+        self,
+        task_id: str,
+        *,
+        encoding: str | None,
+        payload: bytes | None,
+        object_id: str | None,
+    ) -> None:
+        with self._lock:
+            entry = self._tasks.get(task_id)
+            if entry is None:
+                return
+            entry.result_encoding = encoding
+            entry.result_payload = payload
+            metadata = dict(entry.info.metadata)
+            metadata["object_id"] = object_id
+            entry.info.metadata = metadata
 
     def get(self, task_id: str) -> TaskInfo:
         self._maybe_cleanup()
@@ -255,7 +276,14 @@ class TaskManager:
         return self.result_payload(task_id)
 
     def result_payload(self, task_id: str) -> dict[str, str | bytes | None]:
-        info = self.get(task_id)
+        self._maybe_cleanup()
+        with self._lock:
+            entry = self._tasks.get(task_id)
+            if entry is None:
+                raise SharedTensorTaskError(f"Task '{task_id}' was not found")
+            info = copy.deepcopy(entry.info)
+            encoding = entry.result_encoding
+            payload = entry.result_payload
         if info.status == TaskStatus.CANCELLED:
             raise SharedTensorTaskError(f"Task '{task_id}' was cancelled")
         if info.status == TaskStatus.FAILED:
@@ -265,8 +293,8 @@ class TaskManager:
                 f"Task '{task_id}' is not complete; current status is '{info.status.value}'"
             )
         return {
-            "encoding": info.result_encoding,
-            "payload_bytes": info.result_payload,
+            "encoding": encoding,
+            "payload_bytes": payload,
             "object_id": info.metadata.get("object_id"),
         }
 
@@ -309,8 +337,10 @@ class TaskManager:
             }
         return items
 
-    def shutdown(self, *, wait: bool = True) -> None:
-        self._executor.shutdown(wait=wait, cancel_futures=True)
+    def shutdown(self, *, wait: bool = True, cancel_futures: bool = True) -> None:
+        with self._lock:
+            self._accepting_submissions = False
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
 
     def _maybe_cleanup(self) -> None:
         now = time.time()

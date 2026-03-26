@@ -192,8 +192,8 @@ def test_provider_close_closes_all_resources() -> None:
             events.append("async")
 
     class FakeServer:
-        def stop(self):
-            events.append("server")
+        def stop(self, wait_for_tasks=True):
+            events.append(f"server:{wait_for_tasks}")
 
     provider._client = FakeClient()
     provider._async_client = FakeAsyncClient()
@@ -201,7 +201,7 @@ def test_provider_close_closes_all_resources() -> None:
 
     provider.close()
 
-    assert events == ["client", "async", "server"]
+    assert events == ["client", "async", "server:True"]
     assert provider._client is None
     assert provider._async_client is None
     assert provider._server is None
@@ -250,7 +250,7 @@ def test_auto_mode_provider_enabled_false_overrides_enabled_env(
     assert provider.auto_mode is True
 
 
-def test_env_server_role_autostarts_and_restarts_server(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_env_server_role_autostarts_server_once(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
     monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
     monkeypatch.setenv("SHARED_TENSOR_BASE_PATH", "/tmp/shared-tensor-provider")
@@ -275,8 +275,8 @@ def test_env_server_role_autostarts_and_restarts_server(monkeypatch: pytest.Monk
             assert blocking is False
             events.append(("start", self.socket_path))
 
-        def stop(self):
-            events.append(("stop", self.socket_path))
+        def stop(self, wait_for_tasks=True):
+            events.append(("stop", f"{self.socket_path}:{wait_for_tasks}"))
 
     monkeypatch.setattr("shared_tensor.server.SharedTensorServer", FakeServer)
 
@@ -293,14 +293,10 @@ def test_env_server_role_autostarts_and_restarts_server(monkeypatch: pytest.Monk
     assert provider.execution_mode == "server"
     assert first() == "first"
     assert second() == "second"
-    assert events == [
-        ("start", "/tmp/shared-tensor-provider-0.sock"),
-        ("stop", "/tmp/shared-tensor-provider-0.sock"),
-        ("start", "/tmp/shared-tensor-provider-0.sock"),
-    ]
+    assert events == [("start", "/tmp/shared-tensor-provider-0.sock")]
 
     provider.close()
-    assert events[-1] == ("stop", "/tmp/shared-tensor-provider-0.sock")
+    assert events[-1] == ("stop", "/tmp/shared-tensor-provider-0.sock:True")
 
 
 def test_provider_defers_client_construction_until_first_call(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -354,7 +350,7 @@ def test_provider_accepts_explicit_device_index_for_socket_resolution(
         def start(self, blocking=False):
             assert blocking is False
 
-        def stop(self):
+        def stop(self, wait_for_tasks=True):
             return None
 
     monkeypatch.setattr("shared_tensor.server.SharedTensorServer", FakeServer)
@@ -365,7 +361,7 @@ def test_provider_accepts_explicit_device_index_for_socket_resolution(
     def build() -> None:
         return None
 
-    assert observed == [("/tmp/shared-tensor-device-3.sock", 30.0)]
+    assert observed == [('/tmp/shared-tensor-device-3.sock', 30.0)]
 
 
 def test_provider_local_cache_reuses_result_by_default_for_same_call() -> None:
@@ -482,7 +478,7 @@ def test_provider_passes_server_start_options_into_autostart(monkeypatch: pytest
         def start(self, blocking=False):
             assert blocking is False
 
-        def stop(self):
+        def stop(self, wait_for_tasks=True):
             return None
 
     monkeypatch.setattr("shared_tensor.server.SharedTensorServer", FakeServer)
@@ -517,7 +513,9 @@ def test_provider_get_runtime_info_server_mode_reports_running_server() -> None:
     provider = SharedTensorProvider(execution_mode="server", base_path="/tmp/runtime-info")
 
     class FakeServer:
-        def stop(self):
+        running = True
+
+        def stop(self, wait_for_tasks=True):
             return None
 
     provider._server = FakeServer()

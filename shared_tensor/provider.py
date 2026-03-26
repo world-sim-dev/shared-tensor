@@ -8,6 +8,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import wraps
+from threading import RLock
 from typing import Any, Literal
 
 from shared_tensor.errors import (
@@ -113,7 +114,9 @@ class SharedTensorProvider:
         self._cache: dict[str, Any] = {}
         self._endpoints: dict[str, EndpointDefinition] = {}
         self._registered_functions = self._endpoints
-        atexit.register(self.close)
+        self._lock = RLock()
+        self._atexit_registered = False
+        self._register_atexit_once()
 
     def register(
         self,
@@ -129,25 +132,26 @@ class SharedTensorProvider:
     ) -> Callable[..., Any]:
         _validate_endpoint_options(execution=execution, concurrency=concurrency)
         endpoint_name = func.__name__
-        if endpoint_name in self._endpoints:
-            raise SharedTensorProviderError(f"Endpoint '{endpoint_name}' is already registered")
+        with self._lock:
+            if endpoint_name in self._endpoints:
+                raise SharedTensorProviderError(f"Endpoint '{endpoint_name}' is already registered")
 
-        resolved_cache_format_key = (
-            func.__qualname__ if cache_format_key is None else cache_format_key
-        )
+            resolved_cache_format_key = (
+                func.__qualname__ if cache_format_key is None else cache_format_key
+            )
 
-        definition = EndpointDefinition(
-            name=endpoint_name,
-            func=func,
-            cache=cache,
-            cache_format_key=resolved_cache_format_key,
-            managed=managed,
-            async_default_wait=async_default_wait,
-            execution=execution,
-            concurrency=concurrency,
-            singleflight=singleflight,
-        )
-        self._endpoints[endpoint_name] = definition
+            definition = EndpointDefinition(
+                name=endpoint_name,
+                func=func,
+                cache=cache,
+                cache_format_key=resolved_cache_format_key,
+                managed=managed,
+                async_default_wait=async_default_wait,
+                execution=execution,
+                concurrency=concurrency,
+                singleflight=singleflight,
+            )
+            self._endpoints[endpoint_name] = definition
         if self.verbose_debug:
             logger.debug(
                 "Provider registered endpoint",
@@ -161,7 +165,7 @@ class SharedTensorProvider:
             )
 
         if self._should_autostart_server():
-            self._restart_autostart_server()
+            self._ensure_autostart_server()
 
         @wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -272,11 +276,13 @@ class SharedTensorProvider:
             return definition.func(*args, **resolved_kwargs)
 
         cache_key = self._cache_key_for(endpoint, definition, args, resolved_kwargs)
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        with self._lock:
+            if cache_key in self._cache:
+                return self._cache[cache_key]
 
         result = definition.func(*args, **resolved_kwargs)
-        self._cache[cache_key] = result
+        with self._lock:
+            self._cache[cache_key] = result
         return result
 
     def get_endpoint(self, endpoint: str) -> EndpointDefinition:
@@ -309,18 +315,19 @@ class SharedTensorProvider:
             self._async_client.close()
             self._async_client = None
         if self._server is not None:
-            self._server.stop()
+            self._server.stop(wait_for_tasks=True)
             self._server = None
 
     def get_runtime_info(self) -> dict[str, Any]:
         if self.execution_mode in {"server", "local"}:
+            server = self._server
             return {
                 "execution_mode": self.execution_mode,
                 "auto_mode": self.auto_mode,
                 "base_path": self.base_path,
                 "device_index": self.device_index,
                 "server_socket_path": resolve_runtime_socket_path(self.base_path, self.device_index),
-                "server_running": self._server is not None,
+                "server_running": bool(server is not None and getattr(server, "running", True)),
             }
         server_info = self._get_client().get_server_info()
         return {
@@ -361,18 +368,18 @@ class SharedTensorProvider:
     def _should_autostart_server(self) -> bool:
         return self.auto_mode and self.execution_mode == "server"
 
-    def _restart_autostart_server(self) -> None:
+    def _ensure_autostart_server(self) -> None:
         from shared_tensor.server import SharedTensorServer
 
+        if self._server is not None:
+            return
         if self.verbose_debug:
             logger.debug(
-                "Provider restarting autostart server",
+                "Provider starting autostart server",
                 extra={
                     "socket_path": resolve_runtime_socket_path(self.base_path, self.device_index),
                 },
             )
-        if self._server is not None:
-            self._server.stop()
         self._server = SharedTensorServer(
             self,
             socket_path=resolve_runtime_socket_path(self.base_path, self.device_index),
@@ -395,3 +402,9 @@ class SharedTensorProvider:
             func=definition.func,
             cache_format_key=definition.cache_format_key,
         )
+
+    def _register_atexit_once(self) -> None:
+        if self._atexit_registered:
+            return
+        atexit.register(self.close)
+        self._atexit_registered = True

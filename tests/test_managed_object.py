@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from shared_tensor.managed_object import ManagedObjectRegistry, SharedObjectHandle
 
 
@@ -52,6 +54,25 @@ def test_managed_registry_release_missing_object_is_noop() -> None:
     assert result.cache_key is None
 
 
+def test_managed_registry_is_thread_safe_for_refcount_updates() -> None:
+    registry = ManagedObjectRegistry()
+    entry = registry.register(endpoint="load_model", value=object(), cache_key="model:4")
+
+    def worker() -> None:
+        for _ in range(200):
+            registry.add_ref(entry.object_id)
+            registry.release(entry.object_id)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert registry.info(entry.object_id)["refcount"] == 1
+    assert registry.release(entry.object_id).destroyed is True
+
+
 def test_shared_object_handle_releases_once_and_context_manager_marks_released() -> None:
     releaser = _FakeReleaser()
     handle = SharedObjectHandle(object_id="obj-1", value="payload", _releaser=releaser)
@@ -67,4 +88,3 @@ def test_shared_object_handle_releases_once_and_context_manager_marks_released()
         assert ctx.released is False
 
     assert other_releaser.calls == 1
-

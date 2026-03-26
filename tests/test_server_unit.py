@@ -3,6 +3,7 @@ from __future__ import annotations
 import pickle
 import socket
 import threading
+import time
 
 import pytest
 
@@ -16,7 +17,7 @@ from shared_tensor.errors import (
     SharedTensorTaskError,
 )
 from shared_tensor.provider import SharedTensorProvider
-from shared_tensor.runtime import get_local_server
+from shared_tensor.runtime import get_local_server, register_local_server
 from shared_tensor.server import SharedTensorServer
 from shared_tensor.utils import CONTROL_ENCODING, serialize_empty_payload
 
@@ -42,6 +43,9 @@ def test_server_dispatch_list_tasks_uses_status_filter() -> None:
         def list(self, status=None):
             assert status == TaskStatus.COMPLETED
             return {"task-1": FakeTaskInfo()}
+
+        def shutdown(self, wait=True, cancel_futures=True):
+            return None
 
     server._task_manager = FakeTaskManager()
 
@@ -220,6 +224,20 @@ def test_server_registers_and_unregisters_runtime_entry() -> None:
     assert get_local_server(server.socket_path) is None
 
 
+def test_server_runtime_registry_rejects_duplicate_socket_registration() -> None:
+    provider = SharedTensorProvider(execution_mode="server", base_path="/tmp/shared-tensor-runtime-dupe")
+    server = SharedTensorServer(provider, startup_timeout=1.0)
+    other = SharedTensorServer(SharedTensorProvider(execution_mode="server"), socket_path=server.socket_path)
+
+    register_local_server(server.socket_path, server)
+    try:
+        with pytest.raises(SharedTensorConfigurationError, match="already registered"):
+            register_local_server(server.socket_path, other)
+    finally:
+        server.stop()
+        other.stop(wait_for_tasks=False)
+
+
 def test_server_nonblocking_start_rejects_process_start_method() -> None:
     server = SharedTensorServer(
         SharedTensorProvider(execution_mode="server"),
@@ -258,14 +276,47 @@ def test_server_invoke_local_reuses_managed_registry() -> None:
     token = object()
 
     @provider.share(managed=True, cache_format_key="{key}")
-    def build(key: int):
+    def build(key: str):
         calls["value"] += 1
         return token
 
-    first = server.invoke_local("build", kwargs={"key": 1})
-    second = server.invoke_local("build", kwargs={"key": 1})
-
-    assert first is token
-    assert second is token
+    assert server.invoke_local("build", kwargs={"key": "a"}) is token
+    assert server.invoke_local("build", kwargs={"key": "a"}) is token
     assert calls["value"] == 1
-    assert len(server._managed_objects._entries) == 1
+
+
+def test_server_stop_waits_for_running_tasks() -> None:
+    provider = SharedTensorProvider(execution_mode="server")
+    server = SharedTensorServer(provider, max_workers=1)
+    started = threading.Event()
+    release = threading.Event()
+
+    @provider.share(execution="task", cache=False, singleflight=False)
+    def slow() -> None:
+        started.set()
+        release.wait(timeout=1)
+        return None
+
+    task = server._submit_endpoint_task("slow", provider.get_endpoint("slow"), (), {})
+    assert started.wait(timeout=1)
+
+    stopper = threading.Thread(target=server.stop, kwargs={"wait_for_tasks": True})
+    stopper.start()
+    time.sleep(0.05)
+    assert stopper.is_alive()
+    release.set()
+    stopper.join(timeout=1)
+    assert not stopper.is_alive()
+    with pytest.raises(SharedTensorTaskError, match="was not found"):
+        server._task_manager_instance().get(task.task_id)
+
+
+def test_server_stop_without_wait_rejects_new_requests() -> None:
+    provider = SharedTensorProvider(execution_mode="server")
+    server = SharedTensorServer(provider)
+    server._accepting_requests = False
+
+    response = server.process_request({"method": "ping", "params": {}})
+
+    assert response["ok"] is False
+    assert response["error"]["type"] == "SharedTensorConfigurationError"

@@ -37,7 +37,9 @@ def test_async_submit_and_result_flow(running_server) -> None:
     with _client(server) as client:
         task_id = client.submit("slow_noop")
         assert client.wait_for_task(task_id, timeout=2) is None
-        assert client.get_task_status(task_id).status == TaskStatus.COMPLETED
+        status = client.get_task_status(task_id)
+        assert status.status == TaskStatus.COMPLETED
+        assert "result_payload" not in status.to_dict()
 
 
 def test_async_cancel_pending_task(running_server) -> None:
