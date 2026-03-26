@@ -95,6 +95,22 @@ executes endpoint functions         reopens CUDA objects via torch IPC
 manages cache and refcounts         releases managed handles explicitly
 ```
 
+## Lifetime And Failure Contract
+
+`shared_tensor` follows native PyTorch CUDA IPC semantics. It does not virtualize or harden producer lifetime.
+
+Core assumption:
+- the server process that owns the original CUDA allocation must stay alive while clients are still using reopened CUDA tensors or modules
+
+If the server exits, crashes, or is killed before the client is done with the shared CUDA object, behavior is no longer guaranteed by this library. Depending on PyTorch and CUDA runtime state, the client may see CUDA runtime errors, invalid resource handle failures, broken module execution, or process-level instability.
+
+So the production contract is:
+- client-side handles are only valid while the producer process remains alive
+- `handle.release()` is explicit lifecycle cleanup, not durability
+- this library does not promise survivability across producer death
+
+Treat producer liveness as a hard requirement, not a soft optimization.
+
 ## Example: Same Code, Two Processes
 
 See [examples/zero_branch_env.py](./examples/zero_branch_env.py). This is a convenience mode for environments that want one file and environment-controlled behavior.

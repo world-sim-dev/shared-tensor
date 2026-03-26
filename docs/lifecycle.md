@@ -97,6 +97,19 @@ Managed registry retains reusable object ownership.
 
 These are separate stores because one task may create a reusable object whose lifetime extends beyond the task completion moment.
 
+### Producer Lifetime Constraint
+
+```text
+managed handle lifetime is still bounded by producer process lifetime
+```
+
+Even after a client reopens a CUDA tensor or module through torch IPC, `shared_tensor` does not guarantee that the object remains usable after the server process dies.
+
+This library depends on native PyTorch CUDA IPC behavior:
+- if the producer process exits too early, client-side use may fail later
+- explicit release controls registry ownership, not post-crash durability
+- producer liveness is part of the runtime contract
+
 ## 4. Cache Lifecycle
 
 There are two cache categories.
