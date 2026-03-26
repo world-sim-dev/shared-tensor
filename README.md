@@ -13,7 +13,6 @@ Supported:
 - sync `call` and task-backed `submit`
 - managed object handles with explicit release
 - server-side caching, `cache_format_key`, and singleflight
-- manual two-process deployment as the primary production path
 - zero-branch auto mode gated by `SHARED_TENSOR_ENABLED=1`
 
 Not supported:
