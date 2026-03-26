@@ -22,6 +22,7 @@ from shared_tensor.errors import (
 )
 from shared_tensor.managed_object import ManagedObjectRegistry
 from shared_tensor.provider import EndpointDefinition, SharedTensorProvider
+from shared_tensor.runtime import register_local_server, unregister_local_server
 from shared_tensor.transport import recv_message, send_message
 from shared_tensor.utils import (
     CONTROL_ENCODING,
@@ -57,6 +58,12 @@ class _ServerThreadState:
     ready: threading.Event = field(default_factory=threading.Event)
     stopped: threading.Event = field(default_factory=threading.Event)
     error: BaseException | None = None
+
+
+@dataclass(slots=True)
+class _EndpointResult:
+    value: Any
+    object_id: str | None = None
 
 
 class SharedTensorServer:
@@ -197,22 +204,22 @@ class SharedTensorServer:
     ) -> Any:
         return self._task_manager_instance().submit(
             endpoint,
-            self._execute_endpoint_call,
+            self._execute_endpoint_result,
             (endpoint, definition, args, kwargs),
             {},
-            result_encoder=lambda payload: payload,
+            result_encoder=self._encode_endpoint_result,
         )
 
-    def _execute_endpoint_call(
+    def _execute_endpoint_result(
         self,
         endpoint: str,
         definition: EndpointDefinition,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> _EndpointResult:
         cache_key = self._cache_key(endpoint, definition, args, kwargs)
         if cache_key is not None:
-            cached = self._lookup_cached_result(definition, cache_key)
+            cached = self._lookup_cached_result_value(definition, cache_key)
             if cached is not None:
                 if self.verbose_debug:
                     logger.debug("Server cache hit", extra={"endpoint": endpoint, "cache_key": cache_key})
@@ -224,20 +231,15 @@ class SharedTensorServer:
             if self.verbose_debug and owner:
                 logger.debug("Server created singleflight entry", extra={"endpoint": endpoint, "cache_key": inflight_key})
             if not owner:
-                if self.verbose_debug:
-                    logger.debug("Server joined singleflight entry", extra={"endpoint": endpoint, "cache_key": inflight_key})
-                if definition.managed:
-                    payload = future.result()
-                    object_id = payload.get("object_id")
-                    if object_id is not None:
-                        self._managed_objects.add_ref(object_id)
-                    return payload
-                return future.result()
+                result = future.result()
+                if definition.managed and result.object_id is not None:
+                    self._managed_objects.add_ref(result.object_id)
+                return result
         else:
             future = None
 
         try:
-            encoded = self._run_endpoint_under_policy(endpoint, definition, args, kwargs, cache_key)
+            result = self._run_endpoint_under_policy(endpoint, definition, args, kwargs, cache_key)
         except Exception as exc:
             if future is not None:
                 future.set_exception(exc)
@@ -245,9 +247,20 @@ class SharedTensorServer:
             raise
 
         if future is not None:
-            future.set_result(encoded)
+            future.set_result(result)
             self._release_inflight(inflight_key, future)
-        return encoded
+        return result
+
+    def _execute_endpoint_call(
+        self,
+        endpoint: str,
+        definition: EndpointDefinition,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._encode_endpoint_result(
+            self._execute_endpoint_result(endpoint, definition, args, kwargs)
+        )
 
     def _run_endpoint_under_policy(
         self,
@@ -256,11 +269,11 @@ class SharedTensorServer:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         cache_key: str | None,
-    ) -> dict[str, Any]:
+    ) -> _EndpointResult:
         if definition.concurrency == "serialized":
             lock = self._endpoint_lock(endpoint)
             with lock:
-                cached = self._lookup_cached_result(definition, cache_key)
+                cached = self._lookup_cached_result_value(definition, cache_key)
                 if cached is not None:
                     return cached
                 return self._materialize_endpoint_result(endpoint, definition, args, kwargs, cache_key)
@@ -273,17 +286,15 @@ class SharedTensorServer:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         cache_key: str | None,
-    ) -> dict[str, Any]:
+    ) -> _EndpointResult:
         if definition.managed:
             return self._materialize_managed_result(endpoint, definition, args, kwargs, cache_key)
         value = definition.func(*args, **kwargs)
         if self.verbose_debug:
             logger.debug("Server executed direct endpoint", extra={"endpoint": endpoint})
-        result = self._encode_result(value)
         if cache_key is not None:
-            self._cache[cache_key] = result
             self._local_cache[cache_key] = value
-        return result
+        return _EndpointResult(value=value)
 
     def _materialize_managed_result(
         self,
@@ -292,24 +303,24 @@ class SharedTensorServer:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         cache_key: str | None,
-    ) -> dict[str, Any]:
+    ) -> _EndpointResult:
         if cache_key is not None:
             cached = self._managed_objects.get_cached(cache_key)
             if cached is not None:
                 self._managed_objects.add_ref(cached.object_id)
-                return self._encode_result(cached.value, object_id=cached.object_id)
+                return _EndpointResult(value=cached.value, object_id=cached.object_id)
 
         result = definition.func(*args, **kwargs)
         if self.verbose_debug:
             logger.debug("Server created managed object", extra={"endpoint": endpoint, "cache_key": cache_key})
         entry = self._managed_objects.register(endpoint=endpoint, value=result, cache_key=cache_key)
-        return self._encode_result(entry.value, object_id=entry.object_id)
+        return _EndpointResult(value=entry.value, object_id=entry.object_id)
 
-    def _lookup_cached_result(
+    def _lookup_cached_result_value(
         self,
         definition: EndpointDefinition,
         cache_key: str | None,
-    ) -> dict[str, Any] | None:
+    ) -> _EndpointResult | None:
         if cache_key is None:
             return None
         if definition.managed:
@@ -317,16 +328,52 @@ class SharedTensorServer:
             if cached is None:
                 return None
             self._managed_objects.add_ref(cached.object_id)
-            return self._encode_result(cached.value, object_id=cached.object_id)
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            return cached
+            return _EndpointResult(value=cached.value, object_id=cached.object_id)
         local_value = self._local_cache.get(cache_key)
         if local_value is None:
             return None
-        encoded = self._encode_result(local_value)
-        self._cache[cache_key] = encoded
-        return encoded
+        return _EndpointResult(value=local_value)
+
+    def call_local_client(
+        self,
+        endpoint: str,
+        *,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> _EndpointResult | None:
+        definition = self.provider.get_endpoint(endpoint)
+        resolved_kwargs = kwargs or {}
+        if definition.execution == "task":
+            task_info = self._submit_endpoint_task(endpoint, definition, args, resolved_kwargs)
+            return self.wait_task_result_local(task_info.task_id)
+        return self._execute_endpoint_result(endpoint, definition, args, resolved_kwargs)
+
+    def get_task_result_local(self, task_id: str) -> _EndpointResult | None:
+        result = self._task_manager_instance().result_local(task_id)
+        if result is None:
+            return None
+        return result
+
+    def wait_task_result_local(self, task_id: str, timeout: float | None = None) -> _EndpointResult | None:
+        result = self._task_manager_instance().wait_result_local(task_id, timeout=timeout)
+        if result is None:
+            return None
+        return result
+
+    def wait_task_local(self, task_id: str, timeout: float | None = None) -> dict[str, Any]:
+        try:
+            self._task_manager_instance().wait_result_local(task_id, timeout=timeout)
+        except SharedTensorTaskError:
+            info = self._task_manager_instance().get(task_id)
+            if info.status in {TaskStatus.PENDING, TaskStatus.RUNNING}:
+                return info.to_dict()
+            raise
+        return self._task_manager_instance().get(task_id).to_dict()
+
+    def encode_local_result(self, result: _EndpointResult | None) -> dict[str, Any]:
+        if result is None:
+            return {"encoding": None, "payload_bytes": None, "object_id": None}
+        return self._encode_endpoint_result(result)
 
     def invoke_local(
         self,
@@ -455,6 +502,9 @@ class SharedTensorServer:
         encoding, payload = serialize_payload(value)
         return {"encoding": encoding, "payload_bytes": payload, "object_id": object_id}
 
+    def _encode_endpoint_result(self, result: _EndpointResult) -> dict[str, Any]:
+        return self._encode_result(result.value, object_id=result.object_id)
+
     def _task_manager_instance(self) -> TaskManager:
         if self._task_manager is None:
             self._task_manager = TaskManager(
@@ -560,6 +610,7 @@ class SharedTensorServer:
             self.listener = listener
             self.running = True
             self.started_at = time.time()
+            register_local_server(self.socket_path, self)
             if started_event is not None:
                 started_event.set()
             while self.running:
@@ -632,6 +683,7 @@ class SharedTensorServer:
         self._local_cache.clear()
         self._inflight.clear()
         self._endpoint_locks.clear()
+        unregister_local_server(self.socket_path, self)
         unlink_socket_path(self.socket_path)
 
     def __enter__(self) -> SharedTensorServer:

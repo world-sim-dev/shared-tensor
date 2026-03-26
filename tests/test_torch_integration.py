@@ -33,7 +33,7 @@ def test_cpu_tensor_round_trip_over_rpc_is_rejected(running_server, client_for_s
     value = torch.arange(4, dtype=torch.float32)
 
     with client_for_server(server) as client:
-        with pytest.raises(SharedTensorCapabilityError):
+        with pytest.raises(SharedTensorRemoteError):
             client.call("double_tensor", value)
 
 

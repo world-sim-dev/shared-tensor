@@ -350,7 +350,9 @@ def test_sync_client_rejects_plain_python_result_payloads_with_scalar_arg(
             client.call("echo", torch.ones(1, device="cuda"), value=1)
 
 
-def test_auto_server_mode_local_and_remote_calls_share_same_cache(running_server) -> None:
+def test_auto_server_mode_local_and_remote_calls_share_same_cache(
+    running_server, client_for_server
+) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
@@ -373,7 +375,9 @@ def test_auto_server_mode_local_and_remote_calls_share_same_cache(running_server
     assert torch.equal(local_first.cpu(), remote_second.cpu())
 
 
-def test_auto_server_mode_managed_local_and_remote_calls_share_same_object_registry(running_server) -> None:
+def test_auto_server_mode_managed_local_and_remote_calls_share_same_object_registry(
+    running_server, client_for_server
+) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
@@ -403,3 +407,37 @@ def test_auto_server_mode_managed_local_and_remote_calls_share_same_object_regis
 
     assert calls["value"] == 1
     assert torch.equal(local_output.cpu(), remote_output.cpu())
+
+
+def test_thread_backed_local_client_surfaces_remote_style_errors(running_server, client_for_server) -> None:
+    provider = SharedTensorProvider(execution_mode="server")
+
+    @provider.share
+    def plain() -> int:
+        return 1
+
+    server = running_server(provider)
+
+    with client_for_server(server) as client:
+        with pytest.raises(SharedTensorRemoteError) as exc_info:
+            client.call("plain")
+
+    assert exc_info.value.code == 4
+    assert exc_info.value.error_type == "SharedTensorCapabilityError"
+
+
+def test_thread_backed_local_client_task_call_waits_for_completion(running_server, client_for_server) -> None:
+    provider = SharedTensorProvider(execution_mode="server")
+
+    @provider.share(execution="task")
+    def delayed_none() -> None:
+        time.sleep(0.05)
+        return None
+
+    server = running_server(provider, max_workers=1)
+
+    started = time.time()
+    with client_for_server(server) as client:
+        assert client.call("delayed_none") is None
+
+    assert time.time() - started >= 0.04

@@ -8,16 +8,25 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from shared_tensor.errors import (
+    SharedTensorCapabilityError,
     SharedTensorClientError,
+    SharedTensorConfigurationError,
+    SharedTensorError,
+    SharedTensorProviderError,
     SharedTensorProtocolError,
     SharedTensorRemoteError,
+    SharedTensorSerializationError,
+    SharedTensorTaskError,
 )
 from shared_tensor.managed_object import ReleaseHandle, SharedObjectHandle
+from shared_tensor.runtime import get_local_server
 from shared_tensor.transport import recv_message, send_message
+from shared_tensor.async_task import TaskStatus
 from shared_tensor.utils import (
     deserialize_payload,
     resolve_runtime_socket_path,
     serialize_call_payloads,
+    validate_payload_for_transport,
 )
 
 
@@ -49,6 +58,54 @@ class SharedTensorClient:
         self.socket_path = resolve_runtime_socket_path(self.base_path, self.device_index)
         self.timeout = timeout
         self.verbose_debug = verbose_debug
+
+    def _local_server(self):
+        return get_local_server(self.socket_path)
+
+    @staticmethod
+    def _remote_error_from_local(exc: SharedTensorError) -> SharedTensorRemoteError:
+        if isinstance(exc, SharedTensorProtocolError):
+            code = 1
+        elif isinstance(exc, SharedTensorProviderError):
+            code = 2
+        elif isinstance(exc, SharedTensorSerializationError):
+            code = 3
+        elif isinstance(exc, SharedTensorCapabilityError):
+            code = 4
+        elif isinstance(exc, SharedTensorTaskError):
+            code = 5
+        elif isinstance(exc, SharedTensorConfigurationError):
+            code = 6
+        else:
+            code = 7
+        return SharedTensorRemoteError(
+            f"Remote error [{code}]: {exc}",
+            code=code,
+            data=None,
+            error_type=type(exc).__name__,
+        )
+
+    def _run_local(self, operation):
+        try:
+            return operation()
+        except SharedTensorError as exc:
+            raise self._remote_error_from_local(exc) from exc
+
+    def _decode_local_result(self, result: Any) -> Any:
+        if result is None:
+            return None
+        value = result.value
+        if value is None:
+            return None
+        validate_payload_for_transport(value, allow_dict_keys=isinstance(value, dict))
+        object_id = result.object_id
+        if object_id is None:
+            return value
+        return SharedObjectHandle(
+            object_id=cast(str, object_id),
+            value=value,
+            _releaser=_ClientReleaser(client=self, object_id=cast(str, object_id)),
+        )
 
     def _send_request(self, request: dict[str, Any]) -> Any:
         method = request.get("method", "<unknown>")
@@ -104,6 +161,13 @@ class SharedTensorClient:
     def call(self, endpoint: str, *args: Any, **kwargs: Any) -> Any:
         if self.verbose_debug:
             logger.debug("Client calling endpoint", extra={"endpoint": endpoint})
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(
+                lambda: self._decode_local_result(
+                    local_server.call_local_client(endpoint, args=tuple(args), kwargs=dict(kwargs))
+                )
+            )
         encoding, args_payload, kwargs_payload = serialize_call_payloads(tuple(args), dict(kwargs))
         result = self._request(
             "call",
@@ -119,6 +183,19 @@ class SharedTensorClient:
     def submit(self, endpoint: str, *args: Any, **kwargs: Any) -> str:
         if self.verbose_debug:
             logger.debug("Client submitting task", extra={"endpoint": endpoint})
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(
+                lambda: cast(
+                    str,
+                    local_server._submit_endpoint_task(
+                        endpoint,
+                        local_server.provider.get_endpoint(endpoint),
+                        tuple(args),
+                        dict(kwargs),
+                    ).task_id,
+                )
+            )
         encoding, args_payload, kwargs_payload = serialize_call_payloads(tuple(args), dict(kwargs))
         result = self._request(
             "submit",
@@ -134,18 +211,43 @@ class SharedTensorClient:
     def release(self, object_id: str) -> bool:
         if self.verbose_debug:
             logger.debug("Client releasing managed object", extra={"object_id": object_id})
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(
+                lambda: bool(local_server._handle_release_object({"object_id": object_id})["released"])
+            )
         result = self._request("release_object", {"object_id": object_id})
         return bool(result["released"])
 
     def release_many(self, object_ids: list[str]) -> dict[str, bool]:
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(
+                lambda: {
+                    object_id: bool(released)
+                    for object_id, released in local_server._handle_release_objects({"object_ids": object_ids})[
+                        "released"
+                    ].items()
+                }
+            )
         result = self._request("release_objects", {"object_ids": object_ids})
         return {object_id: bool(released) for object_id, released in result["released"].items()}
 
     def get_object_info(self, object_id: str) -> dict[str, Any] | None:
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(
+                lambda: cast(
+                    dict[str, Any] | None,
+                    local_server._handle_get_object_info({"object_id": object_id}).get("object"),
+                )
+            )
         result = self._request("get_object_info", {"object_id": object_id})
         return cast(dict[str, Any] | None, result.get("object"))
 
     def ping(self) -> bool:
+        if self._local_server() is not None:
+            return True
         try:
             self._request("ping")
         except (SharedTensorClientError, SharedTensorRemoteError):
@@ -153,29 +255,66 @@ class SharedTensorClient:
         return True
 
     def get_server_info(self) -> dict[str, Any]:
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(lambda: cast(dict[str, Any], local_server._get_server_info()))
         return cast(dict[str, Any], self._request("get_server_info"))
 
     def list_endpoints(self) -> dict[str, Any]:
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(lambda: cast(dict[str, Any], local_server.provider.list_endpoints()))
         return cast(dict[str, Any], self._request("list_endpoints"))
 
     def get_task_status(self, task_id: str) -> dict[str, Any]:
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(
+                lambda: cast(dict[str, Any], local_server._task_manager_instance().get(task_id).to_dict())
+            )
         return cast(dict[str, Any], self._request("get_task", {"task_id": task_id}))
 
     def get_task_result(self, task_id: str) -> Any:
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(
+                lambda: self._decode_local_result(local_server.get_task_result_local(task_id))
+            )
         return self._decode_rpc_payload(self._request("get_task_result", {"task_id": task_id}))
 
     def wait_task(self, task_id: str, timeout: float | None = None) -> dict[str, Any]:
         if self.verbose_debug:
             logger.debug("Client waiting for task", extra={"task_id": task_id, "timeout": timeout})
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(
+                lambda: cast(dict[str, Any], local_server.wait_task_local(task_id, timeout=timeout))
+            )
         params = {"task_id": task_id}
         if timeout is not None:
             params["timeout"] = timeout
         return cast(dict[str, Any], self._request("wait_task", params))
 
     def cancel_task(self, task_id: str) -> bool:
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(lambda: bool(local_server._task_manager_instance().cancel(task_id)))
         return bool(self._request("cancel_task", {"task_id": task_id})["cancelled"])
 
     def list_tasks(self, status: str | None = None) -> dict[str, Any]:
+        local_server = self._local_server()
+        if local_server is not None:
+            return self._run_local(
+                lambda: cast(
+                    dict[str, Any],
+                    {
+                        listed_task_id: info.to_dict()
+                        for listed_task_id, info in local_server._task_manager_instance()
+                        .list(status=None if status is None else TaskStatus(status))
+                        .items()
+                    },
+                )
+            )
         params = {"status": status} if status else None
         return cast(dict[str, Any], self._request("list_tasks", params))
 

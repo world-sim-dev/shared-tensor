@@ -202,3 +202,6 @@ local_settings.py
 todo.txt
 notes.txt
 README.local.md
+
+# SDK dependency lockfiles
+uv.lock

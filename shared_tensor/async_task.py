@@ -66,6 +66,7 @@ class TaskInfo:
 class _TaskEntry:
     info: TaskInfo
     future: Future[Any]
+    local_result: Any = None
 
 
 class TaskManager:
@@ -139,6 +140,8 @@ class TaskManager:
             )
             return
 
+        self._store_local_result(task_id, result)
+
         if result is None:
             self._transition(
                 task_id,
@@ -191,6 +194,13 @@ class TaskManager:
             for key, value in updates.items():
                 setattr(entry.info, key, value)
 
+    def _store_local_result(self, task_id: str, value: Any) -> None:
+        with self._lock:
+            entry = self._tasks.get(task_id)
+            if entry is None:
+                return
+            entry.local_result = value
+
     def get(self, task_id: str) -> TaskInfo:
         self._maybe_cleanup()
         with self._lock:
@@ -206,6 +216,24 @@ class TaskManager:
         if encoding is None or payload_bytes is None:
             return None
         return deserialize_payload(encoding, payload_bytes)
+
+    def result_local(self, task_id: str) -> Any:
+        self._maybe_cleanup()
+        with self._lock:
+            entry = self._tasks.get(task_id)
+            if entry is None:
+                raise SharedTensorTaskError(f"Task '{task_id}' was not found")
+            info = copy.deepcopy(entry.info)
+            value = entry.local_result
+        if info.status == TaskStatus.CANCELLED:
+            raise SharedTensorTaskError(f"Task '{task_id}' was cancelled")
+        if info.status == TaskStatus.FAILED:
+            raise SharedTensorTaskError(info.error_message or f"Task '{task_id}' failed")
+        if info.status != TaskStatus.COMPLETED:
+            raise SharedTensorTaskError(
+                f"Task '{task_id}' is not complete; current status is '{info.status.value}'"
+            )
+        return value
 
     def wait_result_payload(
         self,
@@ -241,6 +269,21 @@ class TaskManager:
             "payload_bytes": info.result_payload,
             "object_id": info.metadata.get("object_id"),
         }
+
+    def wait_result_local(self, task_id: str, timeout: float | None = None) -> Any:
+        self._maybe_cleanup()
+        with self._lock:
+            entry = self._tasks.get(task_id)
+            if entry is None:
+                raise SharedTensorTaskError(f"Task '{task_id}' was not found")
+            future = entry.future
+        try:
+            future.result(timeout=timeout)
+        except FutureTimeoutError as exc:
+            raise SharedTensorTaskError(
+                f"Task '{task_id}' did not complete within {timeout} seconds"
+            ) from exc
+        return self.result_local(task_id)
 
     def cancel(self, task_id: str) -> bool:
         self._maybe_cleanup()
