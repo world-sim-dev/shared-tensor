@@ -29,6 +29,33 @@ def test_task_manager_wait_result_payload_for_none_result() -> None:
         manager.shutdown(wait=True)
 
 
+def test_task_manager_wait_result_local_returns_none_for_none_result() -> None:
+    manager = TaskManager(max_workers=1, cleanup_interval=0.0)
+    try:
+        info = manager.submit("noop", lambda: None, (), {})
+
+        assert manager.wait_result_local(info.task_id, timeout=1) is None
+        assert manager.result_local(info.task_id) is None
+    finally:
+        manager.shutdown(wait=True)
+
+
+def test_task_manager_retains_local_result_for_same_process_consumers() -> None:
+    manager = TaskManager(max_workers=1, cleanup_interval=0.0)
+    token = object()
+    try:
+        info = manager.submit("token", lambda: token, (), {}, result_encoder=lambda value: {
+            "encoding": None,
+            "payload_bytes": None,
+            "object_id": None,
+        })
+
+        assert manager.wait_result_local(info.task_id, timeout=1) is token
+        assert manager.result_local(info.task_id) is token
+    finally:
+        manager.shutdown(wait=True)
+
+
 def test_task_manager_timeout_surfaces_clear_error() -> None:
     manager = TaskManager(max_workers=1, cleanup_interval=0.0)
     try:

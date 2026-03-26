@@ -513,6 +513,27 @@ def test_provider_get_runtime_info_local_mode() -> None:
     }
 
 
+def test_provider_get_runtime_info_server_mode_reports_running_server() -> None:
+    provider = SharedTensorProvider(execution_mode="server", base_path="/tmp/runtime-info")
+
+    class FakeServer:
+        def stop(self):
+            return None
+
+    provider._server = FakeServer()
+
+    info = provider.get_runtime_info()
+
+    assert info == {
+        "execution_mode": "server",
+        "auto_mode": False,
+        "base_path": "/tmp/runtime-info",
+        "device_index": None,
+        "server_socket_path": "/tmp/runtime-info-0.sock",
+        "server_running": True,
+    }
+
+
 def test_provider_get_runtime_info_client_mode_uses_server_info() -> None:
     provider = SharedTensorProvider(execution_mode="client", base_path="/tmp/runtime-info")
 

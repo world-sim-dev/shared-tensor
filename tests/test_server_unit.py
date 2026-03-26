@@ -16,6 +16,7 @@ from shared_tensor.errors import (
     SharedTensorTaskError,
 )
 from shared_tensor.provider import SharedTensorProvider
+from shared_tensor.runtime import get_local_server
 from shared_tensor.server import SharedTensorServer
 from shared_tensor.utils import CONTROL_ENCODING, serialize_empty_payload
 
@@ -198,6 +199,25 @@ def test_server_nonblocking_start_uses_background_thread(monkeypatch: pytest.Mon
     assert server._resolved_process_start_method == "thread"
     assert len(calls) == 1
     assert calls[0] is not None
+
+
+def test_server_registers_and_unregisters_runtime_entry() -> None:
+    provider = SharedTensorProvider(execution_mode="server", base_path="/tmp/shared-tensor-runtime")
+    server = SharedTensorServer(provider, startup_timeout=1.0)
+
+    def wait_until_registered() -> None:
+        for _ in range(50):
+            if get_local_server(server.socket_path) is server:
+                return
+            threading.Event().wait(0.02)
+        raise AssertionError("server did not register runtime entry")
+
+    server.start(blocking=False)
+    wait_until_registered()
+    assert get_local_server(server.socket_path) is server
+
+    server.stop()
+    assert get_local_server(server.socket_path) is None
 
 
 def test_server_nonblocking_start_rejects_process_start_method() -> None:

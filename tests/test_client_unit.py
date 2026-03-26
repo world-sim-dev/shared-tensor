@@ -4,6 +4,7 @@ import pytest
 
 from shared_tensor import SharedObjectHandle, SharedTensorClient
 from shared_tensor.errors import (
+    SharedTensorCapabilityError,
     SharedTensorClientError,
     SharedTensorProtocolError,
     SharedTensorRemoteError,
@@ -191,5 +192,38 @@ def test_client_release_related_helpers_forward_results(monkeypatch: pytest.Monk
         assert client.get_object_info("a") == {"object_id": "a"}
         assert client.get_server_info() == {"server": "SharedTensorServer"}
         assert client.list_endpoints() == {"load_model": {"managed": True}}
+    finally:
+        client.close()
+
+
+def test_client_decode_local_result_returns_none_for_none_value() -> None:
+    client = SharedTensorClient(device_index=0)
+    try:
+        result = client._decode_local_result(type("LocalResult", (), {"value": None, "object_id": None})())
+        assert result is None
+    finally:
+        client.close()
+
+
+def test_client_decode_local_result_wraps_managed_value_without_serializing(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = SharedTensorClient(device_index=0)
+    token = object()
+    monkeypatch.setattr("shared_tensor.client.validate_payload_for_transport", lambda value, allow_dict_keys=False: None)
+    try:
+        result = client._decode_local_result(
+            type("LocalResult", (), {"value": token, "object_id": "obj-1"})()
+        )
+        assert isinstance(result, SharedObjectHandle)
+        assert result.object_id == "obj-1"
+        assert result.value is token
+    finally:
+        client.close()
+
+
+def test_client_decode_local_result_rejects_unsupported_payload() -> None:
+    client = SharedTensorClient(device_index=0)
+    try:
+        with pytest.raises(SharedTensorCapabilityError):
+            client._decode_local_result(type("LocalResult", (), {"value": 1, "object_id": None})())
     finally:
         client.close()

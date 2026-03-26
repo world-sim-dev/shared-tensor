@@ -75,7 +75,7 @@ docs = [
 [project.urls]
 Homepage = "https://github.com/world-sim-dev/shared-tensor"
 Repository = "https://github.com/world-sim-dev/shared-tensor"
-Documentation = "https://github.com/world-sim-dev/shared-tensor/wiki"
+Documentation = "https://github.com/world-sim-dev/shared-tensor/tree/main/docs"
 "Bug Reports" = "https://github.com/world-sim-dev/shared-tensor/issues"
 Changelog = "https://github.com/world-sim-dev/shared-tensor/releases"
 

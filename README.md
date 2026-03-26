@@ -39,6 +39,16 @@ conda activate shared-tensor-dev
 pip install -e ".[dev,test]"
 ```
 
+## Docs
+
+Read the examples first, then the design notes:
+
+- `docs/overview.md`
+- `docs/patterns.md`
+- `docs/architecture.md`
+- `docs/lifecycle.md`
+- `docs/diagrams.md`
+
 ## Example: Manual Two-Process Deployment
 
 Production should prefer two explicitly started processes: one server process that owns CUDA objects, and one or more client processes that reopen them through torch IPC.
