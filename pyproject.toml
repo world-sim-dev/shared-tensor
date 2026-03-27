@@ -7,7 +7,7 @@ name = "shared-tensor"
 version = "0.2.10"
 description = "Native PyTorch CUDA IPC over Unix Domain Socket for same-host process separation"
 readme = "README.md"
-license = "Apache-2.0"
+license = "MIT"
 authors = [
     {name = "Athena Team", email = "contact@world-sim-dev.org"}
 ]
