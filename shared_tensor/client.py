@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import errno
 import socket
+import time
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -32,6 +34,9 @@ from shared_tensor.utils import (
 
 logger = logging.getLogger(__name__)
 
+CONNECT_RETRY_TIMEOUT_SECONDS = 60.0
+CONNECT_RETRY_INTERVAL_SECONDS = 0.5
+
 
 @dataclass(slots=True)
 class _ClientReleaser(ReleaseHandle):
@@ -53,7 +58,7 @@ class SharedTensorClient:
         base_path: str = "/tmp/shared-tensor",
         *,
         device_index: int | None = None,
-        timeout: float = 30.0,
+        timeout: float = 600.0,
         verbose_debug: bool = False,
     ) -> None:
         self.base_path = base_path
@@ -117,12 +122,35 @@ class SharedTensorClient:
         method = request.get("method", "<unknown>")
         if self.verbose_debug:
             logger.debug("Client sending request", extra={"method": method, "socket_path": self.socket_path})
+        started_at = time.monotonic()
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(self.timeout)
-                sock.connect(self.socket_path)
-                send_message(sock, request)
-                response = recv_message(sock)
+            while True:
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                        sock.settimeout(self.timeout)
+                        sock.connect(self.socket_path)
+                        send_message(sock, request)
+                        response = recv_message(sock)
+                    break
+                except OSError as exc:
+                    retryable = exc.errno in {
+                        errno.ENOENT,
+                        errno.ECONNREFUSED,
+                    }
+                    elapsed = time.monotonic() - started_at
+                    if not retryable or elapsed >= CONNECT_RETRY_TIMEOUT_SECONDS:
+                        raise
+                    if self.verbose_debug:
+                        logger.info(
+                            "Client retrying request connection",
+                            extra={
+                                "method": method,
+                                "socket_path": self.socket_path,
+                                "elapsed": round(elapsed, 3),
+                                "error": str(exc),
+                            },
+                        )
+                    time.sleep(CONNECT_RETRY_INTERVAL_SECONDS)
         except TimeoutError as exc:
             if self.verbose_debug:
                 logger.warning("Client request timed out", extra={"method": method, "socket_path": self.socket_path})

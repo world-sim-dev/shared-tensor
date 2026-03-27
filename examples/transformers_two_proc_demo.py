@@ -1,7 +1,10 @@
+"""One file, two processes, same-code transformers CUDA IPC example."""
+
 from __future__ import annotations
 
-import argparse
+import os
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -9,62 +12,148 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import torch
-from transformers import BertConfig, BertModel
 
-from shared_tensor import SharedTensorClient, SharedTensorProvider, SharedTensorServer
+from shared_tensor import SharedObjectHandle, SharedTensorProvider
 
-BASE_PATH = "/tmp/shared-tensor-transformers-e2e"
+provider = SharedTensorProvider(timeout=float(os.getenv("SHARED_TENSOR_TIMEOUT", "30.0")))
 
 
-def build_model() -> BertModel:
-    model = BertModel(
-        BertConfig(
-            hidden_size=8,
-            intermediate_size=16,
-            num_attention_heads=2,
-            num_hidden_layers=1,
-            vocab_size=32,
+def _require_cuda() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this example")
+
+
+def _model_root() -> Path:
+    raw = os.getenv("TRANSFORMERS_MODEL_ROOT")
+    if not raw:
+        raise RuntimeError(
+            "Set TRANSFORMERS_MODEL_ROOT to a local Hugging Face model directory or models--... cache root"
         )
-    ).cuda()
+    return Path(raw).expanduser()
+
+
+def _resolve_model_path() -> Path:
+    root = _model_root()
+    snapshots_dir = root / "snapshots"
+    if snapshots_dir.is_dir():
+        snapshots = sorted(path for path in snapshots_dir.iterdir() if path.is_dir())
+        if snapshots:
+            return snapshots[-1]
+    if root.is_dir():
+        return root
+    raise FileNotFoundError(f"Transformers model directory not found: {root}")
+
+
+def _prepare_model_path(model_path: Path) -> Path:
+    resolved_model_path = model_path.resolve()
+    path_str = str(resolved_model_path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+    return resolved_model_path
+
+
+def _resolve_auto_class() -> type:
+    import transformers
+
+    class_name = (os.getenv("TRANSFORMERS_AUTO_CLASS") or "AutoModel").strip() or "AutoModel"
+    try:
+        auto_class = getattr(transformers, class_name)
+    except AttributeError as exc:
+        raise RuntimeError(f"Unsupported transformers auto class: {class_name}") from exc
+    if not hasattr(auto_class, "from_pretrained"):
+        raise RuntimeError(f"{class_name} does not expose from_pretrained")
+    return auto_class
+
+
+def _load_model(model_path: Path):
+    auto_class = _resolve_auto_class()
+    model = auto_class.from_pretrained(
+        model_path,
+        trust_remote_code=False,
+        local_files_only=True,
+        low_cpu_mem_usage=False,
+    )
+    model = model.cuda()
     model.eval()
     return model
 
 
-def run_server() -> int:
-    provider = SharedTensorProvider(execution_mode="server", base_path=BASE_PATH)
-
-    @provider.share(execution="task", cache=False, managed=False)
-    def load_model() -> BertModel:
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is required")
-        return build_model()
-
-    SharedTensorServer(provider).start(blocking=True)
-    return 0
+def _cuda_mem_mb() -> float:
+    return round(torch.cuda.memory_allocated() / 1024 / 1024, 2)
 
 
-def run_client() -> int:
-    client = SharedTensorClient(base_path=BASE_PATH, timeout=60.0)
-    model = client.call("load_model")
-    output = model(input_ids=torch.tensor([[1, 2, 3, 4]], device="cuda", dtype=torch.long))
-    print(
-        "CLIENT_OK",
-        {
-            "type": type(model).__name__,
-            "device": str(next(model.parameters()).device),
-            "last_hidden_state_shape": list(output.last_hidden_state.shape),
-        },
-        flush=True,
-    )
-    return 0
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("role", choices=["server", "client"])
-    args = parser.parse_args()
-    return run_server() if args.role == "server" else run_client()
+@provider.share(
+    execution="task",
+    managed=True,
+    concurrency="serialized",
+    cache=True,
+    cache_format_key="transformers:{model_path}",
+)
+def load_model(model_path: str | None = None):
+    _require_cuda()
+    resolved_model_path = _prepare_model_path(Path(model_path) if model_path else _resolve_model_path())
+    return _load_model(resolved_model_path)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _require_cuda()
+    resolved_model_path = _prepare_model_path(_resolve_model_path())
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    before_mem_mb = _cuda_mem_mb()
+    load_started_at = time.perf_counter()
+    result = load_model(model_path=str(resolved_model_path))
+    load_elapsed_ms = round((time.perf_counter() - load_started_at) * 1000, 2)
+    after_mem_mb = _cuda_mem_mb()
+    handle = result if isinstance(result, SharedObjectHandle) else None
+    model = handle.value if handle is not None else result
+    print(
+        "LOAD_STATS",
+        {
+            "mode": provider.execution_mode,
+            "load_model_ms": load_elapsed_ms,
+            "before_mem_mb": before_mem_mb,
+            "after_mem_mb": after_mem_mb,
+            "delta_mem_mb": round(after_mem_mb - before_mem_mb, 2),
+            "peak_mem_mb": round(torch.cuda.max_memory_allocated() / 1024 / 1024, 2),
+        },
+        flush=True,
+    )
+    if provider.execution_mode == "client":
+        print(
+            "LOAD_HINT",
+            {
+                "meaning": "load_model_ms measures shared_tensor retrieval only; shell ELAPSED also includes process start and imports",
+            },
+            flush=True,
+        )
+    print(
+        "MODEL_READY",
+        {
+            "mode": provider.execution_mode,
+            "auto_class": _resolve_auto_class().__name__,
+            "model_path": str(resolved_model_path),
+            "handle": handle is not None,
+            "type": type(model).__name__,
+            "module": type(model).__module__,
+            "device": str(next(model.parameters()).device),
+        },
+        flush=True,
+    )
+    if provider.execution_mode == "server":
+        runtime = provider.get_runtime_info()
+        print(
+            "SERVER_READY",
+            {
+                "socket_path": runtime["server_socket_path"],
+                "model_path": str(resolved_model_path),
+            },
+            flush=True,
+        )
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+    if handle is not None:
+        handle.release()

@@ -9,6 +9,8 @@ import io
 import multiprocessing.reduction as mp_reduction
 import os
 import pickle
+import sys
+import tempfile
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any, cast
@@ -174,16 +176,10 @@ def _serialize_transformers_model(module: Any) -> bytes:
     config = getattr(module, "config", None)
     if config is None:
         raise SharedTensorSerializationError("transformers model is missing a config")
-    if not hasattr(config, "to_dict"):
-        raise SharedTensorSerializationError("transformers model config must provide to_dict()")
+    module_sources = _collect_transformers_module_sources(type(module).__module__, type(config).__module__)
     payload = {
-        "model_module": type(module).__module__,
-        "model_name": type(module).__name__,
-        "config_module": type(config).__module__,
-        "config_name": type(config).__name__,
-        "config_dict": config.to_dict(),
-        "training": bool(module.training),
-        "state_bytes": _torch_serialize(module.state_dict()),
+        "module_sources": module_sources,
+        "module_bytes": _torch_serialize(module),
     }
     return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -240,37 +236,89 @@ def serialize_call_payloads(
         raise SharedTensorSerializationError(f"Failed to serialize call payloads: {exc}") from exc
 
 
-def _load_module_state_dict(module: Any, state_dict: dict[str, Any]) -> None:
-    load_state_dict = module.load_state_dict
-    if "assign" in inspect.signature(load_state_dict).parameters:
-        incompatible = load_state_dict(state_dict, strict=False, assign=True)
-    else:  # pragma: no cover - compatibility fallback
-        incompatible = load_state_dict(state_dict, strict=False)
-    missing = list(getattr(incompatible, "missing_keys", []))
-    unexpected = list(getattr(incompatible, "unexpected_keys", []))
-    if missing or unexpected:
-        raise SharedTensorSerializationError(
-            f"Failed to reconstruct module state: missing={missing[:10]} unexpected={unexpected[:10]}"
-        )
+def _bundle_module_files(module_name: str) -> dict[str, str] | None:
+    module = sys.modules.get(module_name)
+    if module is None:
+        module = importlib.import_module(module_name)
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        return None
+    module_path = Path(module_file).resolve()
+    if module_path.suffix != ".py":
+        return None
+    transformers_root = None
+    if TRANSFORMERS_PRETRAINED_MODEL is not None:
+        transformers_file = getattr(sys.modules.get("transformers"), "__file__", None)
+        if transformers_file is not None:
+            transformers_root = Path(transformers_file).resolve().parent
+    if transformers_root is not None:
+        try:
+            module_path.relative_to(transformers_root)
+            if not module_name.startswith("transformers_modules."):
+                return None
+        except ValueError:
+            pass
+    files = {module_path.name: module_path.read_text(encoding="utf-8")}
+    get_relative_import_files = getattr(importlib.import_module("transformers.dynamic_module_utils"), "get_relative_import_files", None)
+    if callable(get_relative_import_files):
+        for needed in get_relative_import_files(str(module_path)):
+            needed_path = Path(needed).resolve()
+            files[needed_path.name] = needed_path.read_text(encoding="utf-8")
+    return files
+
+
+def _collect_transformers_module_sources(*module_names: str) -> dict[str, dict[str, str]]:
+    bundles: dict[str, dict[str, str]] = {}
+    for module_name in module_names:
+        bundle = _bundle_module_files(module_name)
+        if bundle:
+            bundles[module_name] = bundle
+    return bundles
+
+
+def _stage_transformers_module_sources(module_sources: dict[str, dict[str, str]]) -> None:
+    if not module_sources:
+        return
+    staging_root = Path(tempfile.gettempdir()) / "shared-tensor-transformers-modules"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    root_str = str(staging_root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+    for module_name, files in module_sources.items():
+        parts = module_name.split(".")
+        package_dir = staging_root.joinpath(*parts[:-1])
+        package_dir.mkdir(parents=True, exist_ok=True)
+        current = staging_root
+        for part in parts[:-1]:
+            current = current / part
+            init_file = current / "__init__.py"
+            if not init_file.exists():
+                init_file.write_text("", encoding="utf-8")
+        for filename, content in files.items():
+            (package_dir / filename).write_text(content, encoding="utf-8")
+    importlib.invalidate_caches()
+
+
+def _import_transformers_module(module_name: str, module_sources: dict[str, dict[str, str]]) -> Any:
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError:
+        _stage_transformers_module_sources(module_sources)
+        return importlib.import_module(module_name)
 
 
 def _deserialize_transformers_model(payload: bytes) -> Any:
     encoded = pickle.loads(payload)
-    model_module = importlib.import_module(encoded["model_module"])
-    model_cls = getattr(model_module, encoded["model_name"])
-    config_module = importlib.import_module(encoded["config_module"])
-    config_cls = getattr(config_module, encoded["config_name"])
-    if hasattr(config_cls, "from_dict"):
-        config = config_cls.from_dict(encoded["config_dict"])
-    else:  # pragma: no cover - defensive
-        config = config_cls(**encoded["config_dict"])
-    state_dict = pickle.loads(encoded["state_bytes"])
-    model = model_cls(config)
-    first_tensor = next(iter(state_dict.values()), None)
-    if TORCH_MODULE is not None and isinstance(first_tensor, TORCH_MODULE.Tensor):
-        model = model.to(first_tensor.device)
-    _load_module_state_dict(model, state_dict)
-    model.train(bool(encoded["training"]))
+    module_sources = cast(dict[str, dict[str, str]], encoded.get("module_sources", {}))
+    for module_name in module_sources:
+        _import_transformers_module(module_name, module_sources)
+    module_bytes = encoded.get("module_bytes")
+    if not isinstance(module_bytes, (bytes, bytearray)):
+        raise SharedTensorSerializationError("transformers module payload is invalid")
+    model = pickle.loads(module_bytes)
+    eval_fn = getattr(model, "eval", None)
+    if callable(eval_fn):
+        eval_fn()
     _validate_module_device(model)
     return model
 

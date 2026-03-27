@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import multiprocessing.reduction as mp_reduction
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -268,3 +270,39 @@ def test_cuda_transformers_parametrized_module_round_trip() -> None:
     sample = torch.ones(1, 4, device="cuda")
     actual = result(sample).detach().cpu()
     assert torch.allclose(actual, expected)
+
+
+@pytest.mark.gpu
+def test_cuda_transformers_round_trip_recovers_missing_client_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if _TinyParametrizedPreTrainedModel is None:
+        pytest.skip("transformers is not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    import shared_tensor.utils as utils
+
+    module_name = _TinyParametrizedPreTrainedModel.__module__
+    module = sys.modules[module_name]
+    module_file = getattr(module, "__file__", None)
+    if module_file is None:
+        pytest.skip("test module file is unavailable")
+
+    fake_root = tmp_path / "transformers_modules" / "demo"
+    fake_root.mkdir(parents=True)
+    fake_module_path = fake_root / "modeling_demo.py"
+    fake_module_path.write_text(Path(module_file).read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(module, "__file__", str(fake_module_path))
+
+    model = _TinyParametrizedPreTrainedModel(_TinyTransformersConfig(hidden_size=4)).cuda().eval()
+    encoding, payload = serialize_payload(model)
+
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    result = deserialize_payload(encoding, payload)
+
+    assert type(result).__name__ == type(model).__name__
+    assert next(result.parameters()).is_cuda
+    staged_root = Path(utils.tempfile.gettempdir()) / "shared-tensor-transformers-modules"
+    assert (staged_root / module_name.replace(".", "/")).with_suffix(".py").exists()

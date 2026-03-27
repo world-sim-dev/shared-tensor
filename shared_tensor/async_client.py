@@ -24,7 +24,7 @@ class AsyncSharedTensorClient:
         poll_interval: float = 1.0,
         *,
         device_index: int | None = None,
-        timeout: float = 30.0,
+        timeout: float = 600.0,
     ) -> None:
         self.poll_interval = poll_interval
         self.timeout = timeout
