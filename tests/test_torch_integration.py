@@ -4,6 +4,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import time
+from typing import Any
 
 import pytest
 
@@ -11,6 +12,10 @@ from shared_tensor import SharedTensorClient, SharedTensorProvider, SharedTensor
 from shared_tensor.errors import SharedTensorCapabilityError, SharedTensorRemoteError
 
 torch = pytest.importorskip("torch")
+
+
+def _import_transformers() -> Any:
+    return pytest.importorskip("transformers")
 
 
 def _wait_for_socket(socket_path: str, timeout: float = 30.0) -> None:
@@ -49,6 +54,28 @@ def test_cpu_model_round_trip_over_rpc_is_rejected(running_server, client_for_se
     with client_for_server(server) as client:
         with pytest.raises(SharedTensorRemoteError):
             client.call("build_linear")
+
+
+def test_cpu_transformers_model_round_trip_over_rpc_is_rejected(running_server, client_for_server) -> None:
+    transformers = _import_transformers()
+    provider = SharedTensorProvider(execution_mode="server")
+
+    @provider.share
+    def build_transformers_model():
+        config = transformers.BertConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            vocab_size=32,
+        )
+        return transformers.AutoModel.from_config(config)
+
+    server = running_server(provider)
+
+    with client_for_server(server) as client:
+        with pytest.raises(SharedTensorRemoteError, match="must stay on CUDA"):
+            client.call("build_transformers_model")
 
 
 def _gpu_model_round_trip_worker(queue) -> None:
@@ -119,6 +146,50 @@ def _gpu_tensor_round_trip_worker(queue) -> None:
             pass
 
 
+def _gpu_transformers_model_round_trip_worker(queue) -> None:
+    transformers = _import_transformers()
+    provider = SharedTensorProvider(execution_mode="server")
+
+    @provider.share
+    def build_cuda_transformers_model():
+        config = transformers.BertConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            vocab_size=32,
+        )
+        model = transformers.AutoModel.from_config(config).cuda()
+        model.eval()
+        return model
+
+    base_dir = tempfile.mkdtemp(prefix="shared-tensor-gpu-transformers-")
+    base_path = os.path.join(base_dir, "runtime")
+    provider.base_path = base_path
+    server = SharedTensorServer(provider)
+    server.start(blocking=False)
+    try:
+        _wait_for_socket(server.socket_path)
+        with SharedTensorClient(base_path=base_path) as client:
+            model = client.call("build_cuda_transformers_model")
+        input_ids = torch.tensor([[1, 2, 3, 4]], device="cuda", dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids)
+        output = model(input_ids=input_ids, attention_mask=attention_mask)
+        queue.put(
+            {
+                "is_cuda": next(model.parameters()).is_cuda,
+                "last_hidden_state_shape": list(output.last_hidden_state.shape),
+                "last_hidden_state_device": str(output.last_hidden_state.device),
+            }
+        )
+    finally:
+        server.stop()
+        try:
+            os.rmdir(base_dir)
+        except OSError:
+            pass
+
+
 def _run_gpu_worker(target):
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
@@ -153,3 +224,16 @@ def test_cuda_tensor_round_trip_same_host() -> None:
 
     assert result["is_cuda"] is True
     assert result["result"] == result["expected"]
+
+
+@pytest.mark.gpu
+def test_cuda_transformers_model_round_trip_same_host() -> None:
+    _import_transformers()
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    result = _run_gpu_worker(_gpu_transformers_model_round_trip_worker)
+
+    assert result["is_cuda"] is True
+    assert result["last_hidden_state_shape"] == [1, 4, 8]
+    assert result["last_hidden_state_device"] == "cuda:0"

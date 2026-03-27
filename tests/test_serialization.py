@@ -10,6 +10,7 @@ from shared_tensor.utils import (
     CONTROL_ENCODING,
     SHARED_TENSOR_BASE_PATH_ENV,
     TORCH_ENCODING,
+    TRANSFORMERS_MODEL_ENCODING,
     _normalize_for_cache,
     _validate_call_payload,
     build_cache_key,
@@ -27,6 +28,39 @@ from shared_tensor.utils import (
 )
 
 torch = pytest.importorskip("torch")
+
+try:
+    import transformers as _transformers
+except ImportError:  # pragma: no cover - optional dependency
+    _transformers = None
+
+
+if _transformers is not None:
+    class _TinyTransformersConfig(_transformers.PretrainedConfig):
+        model_type = "tiny-transformers-test"
+
+        def __init__(self, hidden_size: int = 4, **kwargs):
+            super().__init__(**kwargs)
+            self.hidden_size = hidden_size
+
+
+    class _TinyParametrizedPreTrainedModel(_transformers.PreTrainedModel):
+        config_class = _TinyTransformersConfig
+
+        def __init__(self, config: _TinyTransformersConfig):
+            super().__init__(config)
+            self.proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            torch.nn.utils.parametrizations.weight_norm(self.proj, name="weight")
+            with torch.no_grad():
+                self.proj.parametrizations.weight.original0.fill_(1.0)
+                self.proj.parametrizations.weight.original1.fill_(0.25)
+
+        def forward(self, values: torch.Tensor) -> torch.Tensor:
+            return self.proj(values)
+
+else:  # pragma: no cover - optional dependency
+    _TinyTransformersConfig = None
+    _TinyParametrizedPreTrainedModel = None
 
 
 def test_plain_python_payload_is_rejected() -> None:
@@ -165,6 +199,12 @@ def _produce_cuda_payload(kind: str, payload_queue, release_queue) -> None:
     elif kind == "module":
         obj = torch.nn.Linear(2, 2).cuda()
         expected = obj.weight.detach().cpu()
+    elif kind == "transformers_parametrized_module":
+        if _TinyParametrizedPreTrainedModel is None or _TinyTransformersConfig is None:  # pragma: no cover - optional dependency
+            raise AssertionError("transformers is not installed")
+        obj = _TinyParametrizedPreTrainedModel(_TinyTransformersConfig(hidden_size=4)).cuda().eval()
+        sample = torch.ones(1, 4, device="cuda")
+        expected = obj(sample).detach().cpu()
     else:  # pragma: no cover - defensive
         raise AssertionError(f"Unknown kind: {kind}")
     encoding, payload = serialize_payload(obj)
@@ -211,3 +251,20 @@ def test_cuda_module_round_trip() -> None:
     assert isinstance(result, torch.nn.Linear)
     assert next(result.parameters()).is_cuda
     assert torch.equal(result.weight.detach().cpu(), expected)
+
+
+@pytest.mark.gpu
+def test_cuda_transformers_parametrized_module_round_trip() -> None:
+    if _TinyParametrizedPreTrainedModel is None:
+        pytest.skip("transformers is not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    encoding, result, expected = _round_trip_cuda_payload("transformers_parametrized_module")
+
+    assert encoding == TRANSFORMERS_MODEL_ENCODING
+    assert isinstance(result, _TinyParametrizedPreTrainedModel)
+    assert next(result.parameters()).is_cuda
+    sample = torch.ones(1, 4, device="cuda")
+    actual = result(sample).detach().cpu()
+    assert torch.allclose(actual, expected)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import inspect
 import io
 import multiprocessing.reduction as mp_reduction
@@ -23,12 +24,19 @@ try:
 except ImportError:  # pragma: no cover - exercised only without torch installed.
     _torch = cast(Any, None)
 
+try:
+    from transformers import PreTrainedModel as _transformers_pretrained_model
+except ImportError:  # pragma: no cover - exercised when transformers is not installed.
+    _transformers_pretrained_model = cast(Any, None)
+
 
 TORCH_MODULE: Any | None = _torch
+TRANSFORMERS_PRETRAINED_MODEL: Any | None = _transformers_pretrained_model
 
 
 CONTROL_ENCODING = "control_pickle"
 TORCH_ENCODING = "torch_cuda_ipc"
+TRANSFORMERS_MODEL_ENCODING = "torch_transformers_pretrained_model"
 SHARED_TENSOR_BASE_PATH_ENV = "SHARED_TENSOR_BASE_PATH"
 DEFAULT_SOCKET_BASE_PATH = "/tmp/shared-tensor"
 _EMPTY_TUPLE = ()
@@ -162,17 +170,41 @@ def _torch_serialize(obj: Any) -> bytes:
     return buffer.getvalue()
 
 
-def _serialize_ipc_payload(obj: Any) -> bytes:
+def _serialize_transformers_model(module: Any) -> bytes:
+    config = getattr(module, "config", None)
+    if config is None:
+        raise SharedTensorSerializationError("transformers model is missing a config")
+    if not hasattr(config, "to_dict"):
+        raise SharedTensorSerializationError("transformers model config must provide to_dict()")
+    payload = {
+        "model_module": type(module).__module__,
+        "model_name": type(module).__name__,
+        "config_module": type(config).__module__,
+        "config_name": type(config).__name__,
+        "config_dict": config.to_dict(),
+        "training": bool(module.training),
+        "state_bytes": _torch_serialize(module.state_dict()),
+    }
+    return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _serialize_ipc_payload(obj: Any) -> tuple[str, bytes]:
+    if (
+        TORCH_MODULE is not None
+        and TRANSFORMERS_PRETRAINED_MODEL is not None
+        and isinstance(obj, TRANSFORMERS_PRETRAINED_MODEL)
+    ):
+        return TRANSFORMERS_MODEL_ENCODING, _serialize_transformers_model(obj)
     if TORCH_MODULE is not None and isinstance(obj, (TORCH_MODULE.Tensor, TORCH_MODULE.nn.Module)):
-        return _torch_serialize(obj)
-    return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        return TORCH_ENCODING, _torch_serialize(obj)
+    return CONTROL_ENCODING, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def serialize_payload(obj: Any) -> tuple[str, bytes]:
     """Serialize a CUDA torch payload using PyTorch's IPC-aware pickler."""
     try:
         _validate_torch_payload(obj, allow_dict_keys=isinstance(obj, dict))
-        return TORCH_ENCODING, _serialize_ipc_payload(obj)
+        return _serialize_ipc_payload(obj)
     except SharedTensorCapabilityError:
         raise
     except Exception as exc:  # pragma: no cover - defensive
@@ -208,6 +240,38 @@ def serialize_call_payloads(
         raise SharedTensorSerializationError(f"Failed to serialize call payloads: {exc}") from exc
 
 
+def _load_module_state_dict(module: Any, state_dict: dict[str, Any]) -> None:
+    load_state_dict = module.load_state_dict
+    if "assign" in inspect.signature(load_state_dict).parameters:
+        incompatible = load_state_dict(state_dict, strict=False, assign=True)
+    else:  # pragma: no cover - compatibility fallback
+        incompatible = load_state_dict(state_dict, strict=False)
+    missing = list(getattr(incompatible, "missing_keys", []))
+    unexpected = list(getattr(incompatible, "unexpected_keys", []))
+    if missing or unexpected:
+        raise SharedTensorSerializationError(
+            f"Failed to reconstruct module state: missing={missing[:10]} unexpected={unexpected[:10]}"
+        )
+
+
+def _deserialize_transformers_model(payload: bytes) -> Any:
+    encoded = pickle.loads(payload)
+    model_module = importlib.import_module(encoded["model_module"])
+    model_cls = getattr(model_module, encoded["model_name"])
+    config_module = importlib.import_module(encoded["config_module"])
+    config_cls = getattr(config_module, encoded["config_name"])
+    if hasattr(config_cls, "from_dict"):
+        config = config_cls.from_dict(encoded["config_dict"])
+    else:  # pragma: no cover - defensive
+        config = config_cls(**encoded["config_dict"])
+    model = model_cls(config)
+    state_dict = pickle.loads(encoded["state_bytes"])
+    _load_module_state_dict(model, state_dict)
+    model.train(bool(encoded["training"]))
+    _validate_module_device(model)
+    return model
+
+
 def deserialize_payload(encoding: str, data: bytes | str) -> Any:
     """Deserialize a payload produced by :func:`serialize_payload`."""
     payload = bytes.fromhex(data) if isinstance(data, str) else data
@@ -216,6 +280,8 @@ def deserialize_payload(encoding: str, data: bytes | str) -> Any:
             return pickle.loads(payload)
         if encoding == TORCH_ENCODING:
             return pickle.loads(payload)
+        if encoding == TRANSFORMERS_MODEL_ENCODING:
+            return _deserialize_transformers_model(payload)
         raise SharedTensorSerializationError(f"Unsupported payload encoding: {encoding}")
     except SharedTensorCapabilityError:
         raise
