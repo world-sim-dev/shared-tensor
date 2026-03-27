@@ -264,8 +264,11 @@ def _deserialize_transformers_model(payload: bytes) -> Any:
         config = config_cls.from_dict(encoded["config_dict"])
     else:  # pragma: no cover - defensive
         config = config_cls(**encoded["config_dict"])
-    model = model_cls(config)
     state_dict = pickle.loads(encoded["state_bytes"])
+    model = model_cls(config)
+    first_tensor = next(iter(state_dict.values()), None)
+    if TORCH_MODULE is not None and isinstance(first_tensor, TORCH_MODULE.Tensor):
+        model = model.to(first_tensor.device)
     _load_module_state_dict(model, state_dict)
     model.train(bool(encoded["training"]))
     _validate_module_device(model)
