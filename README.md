@@ -39,6 +39,8 @@ conda activate shared-tensor-dev
 pip install -e ".[dev,test]"
 ```
 
+If you want to share Hugging Face `transformers` models, install `transformers` in both the server and client environments as well.
+
 ## Docs
 
 Read the examples first, then the design notes:
@@ -96,6 +98,33 @@ owns CUDA allocations               issues local UDS RPC requests
 executes endpoint functions         reopens CUDA objects via torch IPC
 manages cache and refcounts         releases managed handles explicitly
 ```
+
+## Example: Transformers Models
+
+`shared_tensor` also supports CUDA `transformers.PreTrainedModel` instances.
+
+See:
+- `examples/transformers_two_proc_demo.py`: minimal same-code two-process demo using `AutoModel`-style loading
+- `examples/transformers_mutation_check.py`: proves client-side in-place parameter mutation is visible on the server
+- `examples/transformers_ipc_benchmark.py`: measures reopen latency and client GPU memory delta
+
+Usage:
+
+```bash
+TRANSFORMERS_MODEL_ROOT=/path/to/model-or-hf-cache/models--bert-base-uncased \
+SHARED_TENSOR_ENABLED=1 SHARED_TENSOR_ROLE=server \
+python examples/transformers_two_proc_demo.py
+
+TRANSFORMERS_MODEL_ROOT=/path/to/model-or-hf-cache/models--bert-base-uncased \
+SHARED_TENSOR_ENABLED=1 \
+python examples/transformers_two_proc_demo.py
+```
+
+Notes:
+- `TRANSFORMERS_MODEL_ROOT` may point either to a resolved local model directory or to a Hugging Face cache root like `models--...`; the example resolves the newest snapshot automatically
+- `TRANSFORMERS_AUTO_CLASS` defaults to `AutoModel` and can be overridden to another `Auto*` class that exposes `from_pretrained`
+- for custom `transformers` code paths, the library stages the required module source files before reopening the shared module on the client
+- transport remains same-host same-GPU torch CUDA IPC; the client should reopen quickly and should not allocate a second full model copy just to reconstruct parameters
 
 ## Lifetime And Failure Contract
 
@@ -293,6 +322,8 @@ Use call-level invalidation when you want to evict one cache key.
 Use endpoint-level invalidation when you want to drop all cached variants for the endpoint.
 Invalidation removes cache lookup entries; it does not guarantee that already-issued client handles remain valid after producer death.
 
+For cached `transformers` model endpoints, keep `cache=True` unless you explicitly want every request to rebuild and re-share the model.
+
 
 ## Handle Health Checks
 
@@ -316,6 +347,22 @@ In client mode, `provider.get_runtime_info()` wraps that into a provider-oriente
 ```python
 info = provider.get_runtime_info()
 # execution_mode, server_socket_path, server_running, server_ready, server_info...
+```
+
+## Client Retry And Timeout Defaults
+
+The client now retries initial connection setup for up to `60s` when the server socket is not ready yet, covering the common server-startup race where the client starts slightly earlier.
+
+Default request timeout is now `600s` for:
+- `SharedTensorClient`
+- `AsyncSharedTensorClient`
+- `SharedTensorProvider`
+
+You can still override these per instance:
+
+```python
+client = SharedTensorClient(timeout=120.0)
+provider = SharedTensorProvider(timeout=120.0)
 ```
 
 ## Testing
