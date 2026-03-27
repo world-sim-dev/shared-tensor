@@ -7,6 +7,9 @@ Modules that are meant to back a dedicated server process now construct provider
 - [zero_branch_env.py](/Users/mapix/workspace/shared-tensor/examples/zero_branch_env.py): one file, two processes, env-controlled auto mode
 - [basic_service.py](/Users/mapix/workspace/shared-tensor/examples/basic_service.py): minimal direct endpoint examples
 - [async_service.py](/Users/mapix/workspace/shared-tensor/examples/async_service.py): task submission and wait flow using `SharedTensorProvider(execution="task")` and `AsyncSharedTensorClient`
+- [transformers_two_proc_demo.py](/Users/mapix/workspace/shared-tensor/examples/transformers_two_proc_demo.py): minimal two-process CUDA `transformers` model sharing demo
+- [songformer_manual_probe.py](/Users/mapix/workspace/shared-tensor/examples/songformer_manual_probe.py): SongFormer-specific offline load probe for a complex custom `transformers` model
+- [songformer_manual_probe.py](/Users/mapix/workspace/shared-tensor/examples/songformer_manual_probe.py): SongFormer-specific offline load probe used to verify a complex custom `transformers` model
 
 Recommended production pattern: start a dedicated server process around `model_service.py`, then connect from clients with `SharedTensorClient`.
 
