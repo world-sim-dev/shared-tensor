@@ -306,3 +306,30 @@ def test_cuda_transformers_round_trip_recovers_missing_client_module(
     assert next(result.parameters()).is_cuda
     staged_root = Path(utils.tempfile.gettempdir()) / "shared-tensor-transformers-modules"
     assert (staged_root / module_name.replace(".", "/")).with_suffix(".py").exists()
+
+
+@pytest.mark.gpu
+def test_cuda_transformers_round_trip_preserves_named_state_layout() -> None:
+    if _TinyParametrizedPreTrainedModel is None:
+        pytest.skip("transformers is not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    model = _TinyParametrizedPreTrainedModel(_TinyTransformersConfig(hidden_size=4)).cuda().eval()
+    expected_parameters = list(model.named_parameters(remove_duplicate=False))
+    expected_buffers = list(model.named_buffers(remove_duplicate=False))
+
+    encoding, payload = serialize_payload(model)
+    result = deserialize_payload(encoding, payload)
+
+    actual_parameters = list(result.named_parameters(remove_duplicate=False))
+    actual_buffers = list(result.named_buffers(remove_duplicate=False))
+
+    assert [name for name, _ in actual_parameters] == [name for name, _ in expected_parameters]
+    assert [name for name, _ in actual_buffers] == [name for name, _ in expected_buffers]
+    for (expected_name, expected_value), (actual_name, actual_value) in zip(
+        expected_parameters, actual_parameters, strict=True
+    ):
+        assert expected_name == actual_name
+        assert actual_value.is_cuda
+        assert torch.equal(actual_value.detach().cpu(), expected_value.detach().cpu())

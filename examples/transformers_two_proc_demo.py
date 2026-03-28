@@ -15,7 +15,7 @@ import torch
 
 from shared_tensor import SharedObjectHandle, SharedTensorProvider
 
-provider = SharedTensorProvider(timeout=float(os.getenv("SHARED_TENSOR_TIMEOUT", "30.0")))
+provider = SharedTensorProvider(timeout=float(os.getenv("SHARED_TENSOR_TIMEOUT", "600.0")))
 
 
 def _require_cuda() -> None:
@@ -78,6 +78,29 @@ def _load_model(model_path: Path):
     return model
 
 
+def _shared_load_metrics(model_path: Path):
+    before_mem_mb = _cuda_mem_mb()
+    first_started_at = time.perf_counter()
+    first_result = load_model(model_path=str(model_path))
+    first_elapsed_ms = round((time.perf_counter() - first_started_at) * 1000, 2)
+    after_first_mem_mb = _cuda_mem_mb()
+
+    second_started_at = time.perf_counter()
+    second_result = load_model(model_path=str(model_path))
+    second_elapsed_ms = round((time.perf_counter() - second_started_at) * 1000, 2)
+    after_second_mem_mb = _cuda_mem_mb()
+
+    return {
+        "first_result": first_result,
+        "second_result": second_result,
+        "first_elapsed_ms": first_elapsed_ms,
+        "second_elapsed_ms": second_elapsed_ms,
+        "before_mem_mb": before_mem_mb,
+        "after_first_mem_mb": after_first_mem_mb,
+        "after_second_mem_mb": after_second_mem_mb,
+    }
+
+
 def _cuda_mem_mb() -> float:
     return round(torch.cuda.memory_allocated() / 1024 / 1024, 2)
 
@@ -100,21 +123,24 @@ if __name__ == "__main__":
     resolved_model_path = _prepare_model_path(_resolve_model_path())
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    before_mem_mb = _cuda_mem_mb()
-    load_started_at = time.perf_counter()
-    result = load_model(model_path=str(resolved_model_path))
-    load_elapsed_ms = round((time.perf_counter() - load_started_at) * 1000, 2)
-    after_mem_mb = _cuda_mem_mb()
+    metrics = _shared_load_metrics(resolved_model_path)
+    result = metrics["first_result"]
+    second_result = metrics["second_result"]
+    after_mem_mb = metrics["after_first_mem_mb"]
     handle = result if isinstance(result, SharedObjectHandle) else None
     model = handle.value if handle is not None else result
+    second_handle = second_result if isinstance(second_result, SharedObjectHandle) else None
     print(
         "LOAD_STATS",
         {
             "mode": provider.execution_mode,
-            "load_model_ms": load_elapsed_ms,
-            "before_mem_mb": before_mem_mb,
+            "load_model_ms": metrics["first_elapsed_ms"],
+            "reload_model_ms": metrics["second_elapsed_ms"],
+            "before_mem_mb": metrics["before_mem_mb"],
             "after_mem_mb": after_mem_mb,
-            "delta_mem_mb": round(after_mem_mb - before_mem_mb, 2),
+            "after_reload_mem_mb": metrics["after_second_mem_mb"],
+            "delta_mem_mb": round(after_mem_mb - metrics["before_mem_mb"], 2),
+            "delta_reload_mem_mb": round(metrics["after_second_mem_mb"] - after_mem_mb, 2),
             "peak_mem_mb": round(torch.cuda.max_memory_allocated() / 1024 / 1024, 2),
         },
         flush=True,
@@ -123,7 +149,7 @@ if __name__ == "__main__":
         print(
             "LOAD_HINT",
             {
-                "meaning": "load_model_ms measures shared_tensor retrieval only; shell ELAPSED also includes process start and imports",
+                "meaning": "load_model_ms includes the first shared_tensor reopen in this client process; reload_model_ms shows same-process warm reopen after class resolution/import has already happened",
             },
             flush=True,
         )
@@ -157,3 +183,5 @@ if __name__ == "__main__":
             pass
     if handle is not None:
         handle.release()
+    if second_handle is not None:
+        second_handle.release()

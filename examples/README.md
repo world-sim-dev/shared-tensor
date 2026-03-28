@@ -10,6 +10,8 @@ Modules that are meant to back a dedicated server process now construct provider
 - [transformers_two_proc_demo.py](/Users/mapix/workspace/shared-tensor/examples/transformers_two_proc_demo.py): smallest two-process CUDA `transformers` model sharing demo
 - [transformers_mutation_check.py](/Users/mapix/workspace/shared-tensor/examples/transformers_mutation_check.py): verifies client-side parameter mutation is observed by the server for a shared `transformers` model
 - [transformers_ipc_benchmark.py](/Users/mapix/workspace/shared-tensor/examples/transformers_ipc_benchmark.py): synthetic benchmark for `transformers` IPC reopen latency and client GPU memory delta
+- [transformers_two_proc_trace.py](/Users/mapix/workspace/shared-tensor/examples/transformers_two_proc_trace.py): low-level tracing helper for server/client serialize and deserialize timing
+- [transformers_restore_profile.py](/Users/mapix/workspace/shared-tensor/examples/transformers_restore_profile.py): compares legacy full-module restore against the current meta-shell state-rebind restore path
 
 Recommended production pattern: start a dedicated server process around `model_service.py`, then connect from clients with `SharedTensorClient`.
 
@@ -35,6 +37,8 @@ python examples/transformers_two_proc_demo.py
 ```
 
 `TRANSFORMERS_MODEL_ROOT` may point either at a concrete model directory or a Hugging Face cache root containing `snapshots/`; the example resolves the newest snapshot automatically. `TRANSFORMERS_AUTO_CLASS` defaults to `AutoModel`.
+
+For `transformers` specifically, a fresh client Python process may still spend noticeable time in module import and class resolution before the shared object is ready. That cold-process cost is outside the CUDA IPC reopen path itself; a second reopen inside the same client process should be much faster and should still avoid allocating a second full GPU copy.
 
 The default client behavior now tolerates normal startup races: connection setup retries for up to `60s`, and request timeout defaults to `600s`.
 

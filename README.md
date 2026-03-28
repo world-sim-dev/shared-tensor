@@ -124,7 +124,8 @@ Notes:
 - `TRANSFORMERS_MODEL_ROOT` may point either to a resolved local model directory or to a Hugging Face cache root like `models--...`; the example resolves the newest snapshot automatically
 - `TRANSFORMERS_AUTO_CLASS` defaults to `AutoModel` and can be overridden to another `Auto*` class that exposes `from_pretrained`
 - for custom `transformers` code paths, the library stages the required module source files before reopening the shared module on the client
-- transport remains same-host same-GPU torch CUDA IPC; the client should reopen quickly and should not allocate a second full model copy just to reconstruct parameters
+- transport remains same-host same-GPU torch CUDA IPC; the client should not allocate a second full model copy just to reconstruct parameters
+- in a fresh client Python process, the first reopen may still look slow because `transformers` import/module resolution is often much slower than the shared-tensor IPC restore path itself; a second reopen in the same process should be much faster
 
 ## Lifetime And Failure Contract
 

@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - exercised when transformers is not ins
 
 TORCH_MODULE: Any | None = _torch
 TRANSFORMERS_PRETRAINED_MODEL: Any | None = _transformers_pretrained_model
+_TRANSFORMERS_CLASS_CACHE: dict[tuple[str, str], Any] = {}
 
 
 CONTROL_ENCODING = "control_pickle"
@@ -177,9 +178,20 @@ def _serialize_transformers_model(module: Any) -> bytes:
     if config is None:
         raise SharedTensorSerializationError("transformers model is missing a config")
     module_sources = _collect_transformers_module_sources(type(module).__module__, type(config).__module__)
+    parameters = dict(module.named_parameters(remove_duplicate=False))
+    buffers = dict(module.named_buffers(remove_duplicate=False))
     payload = {
         "module_sources": module_sources,
-        "module_bytes": _torch_serialize(module),
+        "config_bytes": pickle.dumps(config, protocol=pickle.HIGHEST_PROTOCOL),
+        "model_module": type(module).__module__,
+        "model_qualname": type(module).__qualname__,
+        "state_bytes": _torch_serialize(
+            {
+                "parameters": parameters,
+                "buffers": buffers,
+            }
+        ),
+        "training": bool(getattr(module, "training", False)),
     }
     return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -307,17 +319,128 @@ def _import_transformers_module(module_name: str, module_sources: dict[str, dict
         return importlib.import_module(module_name)
 
 
+def _resolve_module_qualname(module_name: str, qualname: str) -> Any:
+    cache_key = (module_name, qualname)
+    cached = _TRANSFORMERS_CLASS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    module = importlib.import_module(module_name)
+    current: Any = module
+    for part in qualname.split("."):
+        current = getattr(current, part)
+    _TRANSFORMERS_CLASS_CACHE[cache_key] = current
+    return current
+
+
+def _build_transformers_meta_shell(model_cls: Any, config: Any) -> Any:
+    if TORCH_MODULE is None:
+        raise SharedTensorSerializationError("PyTorch is required for transformers deserialization")
+    try:
+        with TORCH_MODULE.device("meta"):
+            model = model_cls(config)
+    except Exception as exc:
+        raise SharedTensorSerializationError(
+            f"Failed to construct transformers model shell on meta device: {exc}"
+        ) from exc
+    return model
+
+
+def _resolve_parent_module(root: Any, parent_name: str) -> Any:
+    if not parent_name:
+        return root
+    get_submodule = getattr(root, "get_submodule", None)
+    if callable(get_submodule):
+        return get_submodule(parent_name)
+    current = root
+    for part in parent_name.split("."):
+        current = getattr(current, part)
+    return current
+
+
+def _rebind_named_parameter(module: Any, name: str, value: Any) -> None:
+    parent_name, _, local_name = name.rpartition(".")
+    parent = _resolve_parent_module(module, parent_name)
+    parent._parameters[local_name] = value
+
+
+def _rebind_named_buffer(module: Any, name: str, value: Any) -> None:
+    parent_name, _, local_name = name.rpartition(".")
+    parent = _resolve_parent_module(module, parent_name)
+    parent._buffers[local_name] = value
+
+
+def _validate_transformers_state_layout(module: Any, parameters: dict[str, Any], buffers: dict[str, Any]) -> None:
+    expected_parameters = dict(module.named_parameters(remove_duplicate=False))
+    expected_buffers = dict(module.named_buffers(remove_duplicate=False))
+    if set(expected_parameters) != set(parameters):
+        raise SharedTensorSerializationError(
+            "Transformers parameter layout mismatch between serialized model and client shell"
+        )
+    if set(expected_buffers) != set(buffers):
+        raise SharedTensorSerializationError(
+            "Transformers buffer layout mismatch between serialized model and client shell"
+        )
+    for name, expected in expected_parameters.items():
+        actual = parameters[name]
+        if not isinstance(actual, TORCH_MODULE.nn.Parameter):
+            raise SharedTensorSerializationError(
+                f"Transformers parameter '{name}' payload is not a torch.nn.Parameter"
+            )
+        if actual.shape != expected.shape or actual.dtype != expected.dtype:
+            raise SharedTensorSerializationError(
+                f"Transformers parameter '{name}' shape or dtype does not match the client shell"
+            )
+    for name, expected in expected_buffers.items():
+        actual = buffers[name]
+        if not isinstance(actual, TORCH_MODULE.Tensor):
+            raise SharedTensorSerializationError(
+                f"Transformers buffer '{name}' payload is not a torch.Tensor"
+            )
+        if actual.shape != expected.shape or actual.dtype != expected.dtype:
+            raise SharedTensorSerializationError(
+                f"Transformers buffer '{name}' shape or dtype does not match the client shell"
+            )
+
+
+def _restore_transformers_state(module: Any, state: dict[str, Any]) -> Any:
+    parameters = cast(dict[str, Any], state.get("parameters", {}))
+    buffers = cast(dict[str, Any], state.get("buffers", {}))
+    _validate_transformers_state_layout(module, parameters, buffers)
+    for name, value in parameters.items():
+        _rebind_named_parameter(module, name, value)
+    for name, value in buffers.items():
+        _rebind_named_buffer(module, name, value)
+    return module
+
+
 def _deserialize_transformers_model(payload: bytes) -> Any:
     encoded = pickle.loads(payload)
     module_sources = cast(dict[str, dict[str, str]], encoded.get("module_sources", {}))
     for module_name in module_sources:
         _import_transformers_module(module_name, module_sources)
-    module_bytes = encoded.get("module_bytes")
-    if not isinstance(module_bytes, (bytes, bytearray)):
-        raise SharedTensorSerializationError("transformers module payload is invalid")
-    model = pickle.loads(module_bytes)
+    config_bytes = encoded.get("config_bytes")
+    state_bytes = encoded.get("state_bytes")
+    model_module = encoded.get("model_module")
+    model_qualname = encoded.get("model_qualname")
+    if not isinstance(config_bytes, (bytes, bytearray)):
+        raise SharedTensorSerializationError("transformers config payload is invalid")
+    if not isinstance(state_bytes, (bytes, bytearray)):
+        raise SharedTensorSerializationError("transformers state payload is invalid")
+    if not isinstance(model_module, str) or not model_module:
+        raise SharedTensorSerializationError("transformers model module is invalid")
+    if not isinstance(model_qualname, str) or not model_qualname:
+        raise SharedTensorSerializationError("transformers model qualname is invalid")
+    config = pickle.loads(config_bytes)
+    model_cls = _resolve_module_qualname(model_module, model_qualname)
+    model = _build_transformers_meta_shell(model_cls, config)
+    state = pickle.loads(state_bytes)
+    model = _restore_transformers_state(model, cast(dict[str, Any], state))
+    train_fn = getattr(model, "train", None)
+    training = bool(encoded.get("training", False))
+    if callable(train_fn):
+        train_fn(training)
     eval_fn = getattr(model, "eval", None)
-    if callable(eval_fn):
+    if callable(eval_fn) and not training:
         eval_fn()
     _validate_module_device(model)
     return model
