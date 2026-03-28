@@ -19,11 +19,13 @@ import shared_tensor.utils as utils
 
 BASE_PATH = "/tmp/shared-tensor-trace"
 MODEL_ID = "bert-base-uncased"
+HF_CACHE_DIR = os.getenv("HF_HUB_CACHE", "/home/niubility2/pretrained_models/huggingface/hub")
 
 
 def _resolve_model_path() -> str:
     return snapshot_download(
         repo_id=MODEL_ID,
+        cache_dir=HF_CACHE_DIR,
         local_files_only=True,
     )
 

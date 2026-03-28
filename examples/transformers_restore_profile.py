@@ -20,6 +20,7 @@ from shared_tensor.utils import _torch_forking_pickler
 
 
 MODEL_ID = "bert-base-uncased"
+HF_CACHE_DIR = os.getenv("HF_HUB_CACHE", "/home/niubility2/pretrained_models/huggingface/hub")
 
 
 def _torch_serialize(obj):

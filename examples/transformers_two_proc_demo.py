@@ -20,6 +20,7 @@ from shared_tensor import SharedObjectHandle, SharedTensorProvider
 
 provider = SharedTensorProvider(timeout=float(os.getenv("SHARED_TENSOR_TIMEOUT", "600.0")))
 MODEL_ID = "bert-base-uncased"
+HF_CACHE_DIR = os.getenv("HF_HUB_CACHE", "/home/niubility2/pretrained_models/huggingface/hub")
 
 
 def _require_cuda() -> None:
@@ -32,6 +33,7 @@ def _resolve_model_path() -> Path:
         return Path(
             snapshot_download(
                 repo_id=MODEL_ID,
+                cache_dir=HF_CACHE_DIR,
                 local_files_only=True,
             )
         )
