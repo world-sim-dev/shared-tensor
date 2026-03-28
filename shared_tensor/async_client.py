@@ -20,7 +20,7 @@ class AsyncSharedTensorClient:
     def __init__(
         self,
         base_path: str = "/tmp/shared-tensor",
-        verbose_debug: bool = False,
+        verbose_debug: bool = True,
         poll_interval: float = 1.0,
         *,
         device_index: int | None = None,

@@ -9,6 +9,13 @@ from shared_tensor.errors import (
 )
 
 
+
+
+def test_provider_defaults_to_verbose_debug() -> None:
+    provider = SharedTensorProvider(execution_mode="local")
+
+    assert provider.verbose_debug is True
+
 def test_provider_registers_function_name_endpoints() -> None:
     provider = SharedTensorProvider(execution_mode="local")
 

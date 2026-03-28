@@ -14,6 +14,15 @@ from shared_tensor.utils import CONTROL_ENCODING, serialize_empty_payload
 pytest.importorskip("torch")
 
 
+
+
+def test_client_defaults_to_verbose_debug() -> None:
+    client = SharedTensorClient(device_index=0)
+    try:
+        assert client.verbose_debug is True
+    finally:
+        client.close()
+
 def test_client_decode_rpc_payload_returns_none_for_empty_result() -> None:
     client = SharedTensorClient(device_index=0)
     try:

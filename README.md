@@ -351,6 +351,15 @@ info = provider.get_runtime_info()
 # execution_mode, server_socket_path, server_running, server_ready, server_info...
 ```
 
+## Logging
+
+`shared_tensor` now installs a default package logger on import and enables detailed logs by default.
+
+- default level: `DEBUG`
+- logger name: `shared_tensor`
+- override level with `SHARED_TENSOR_LOG_LEVEL`, for example `INFO`, `WARNING`, or `ERROR`
+- pass `verbose_debug=False` to `SharedTensorProvider`, `SharedTensorClient`, `AsyncSharedTensorClient`, or `SharedTensorServer` if you want to suppress detailed request-level logs
+
 ## Client Retry And Timeout Defaults
 
 The client now retries initial connection setup for up to `60s` when the server socket is not ready yet, covering the common server-startup race where the client starts slightly earlier.

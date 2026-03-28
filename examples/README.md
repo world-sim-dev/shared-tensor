@@ -48,3 +48,7 @@ Socket selection is device-aware:
 
 Manual mode is programmatic only: construct `SharedTensorServer(provider, socket_path=...)` and call `start()`.
 For production-style startup control, you can inspect `provider.get_runtime_info()` / `client.get_server_info()`. Background autostart uses a thread inside the current process; explicit production servers should still use a dedicated process.
+
+## Logging
+
+By default, the library now emits detailed `shared_tensor` logs. Set `SHARED_TENSOR_LOG_LEVEL=INFO` or `WARNING` if you want less output, or pass `verbose_debug=False` when constructing provider/client/server objects in custom scripts.

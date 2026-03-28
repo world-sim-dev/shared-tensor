@@ -59,7 +59,7 @@ class SharedTensorClient:
         *,
         device_index: int | None = None,
         timeout: float = 600.0,
-        verbose_debug: bool = False,
+        verbose_debug: bool = True,
     ) -> None:
         self.base_path = base_path
         self.device_index = device_index

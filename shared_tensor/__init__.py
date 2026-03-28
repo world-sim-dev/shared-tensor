@@ -1,5 +1,24 @@
 """shared_tensor: same-host same-GPU PyTorch CUDA IPC over local UDS RPC."""
 
+import logging
+import os
+
+
+def _configure_default_logging() -> None:
+    logger = logging.getLogger("shared_tensor")
+    if logger.handlers:
+        return
+    level_name = os.getenv("SHARED_TENSOR_LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    level = getattr(logging, level_name, logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[shared_tensor] %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
+
+
+_configure_default_logging()
+
 from shared_tensor.async_client import AsyncSharedTensorClient
 from shared_tensor.async_task import TaskInfo, TaskStatus
 from shared_tensor.client import SharedTensorClient

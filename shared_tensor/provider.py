@@ -94,7 +94,7 @@ class SharedTensorProvider:
         timeout: float = 600.0,
         execution_mode: str = "auto",
         server_startup_timeout: float = 30.0,
-        verbose_debug: bool = False,
+        verbose_debug: bool = True,
     ) -> None:
         resolved_mode, auto_mode = _resolve_execution_mode(
             execution_mode,

@@ -97,7 +97,7 @@ class SharedTensorServer:
         result_ttl: float = 3600.0,
         process_start_method: str | None = None,
         startup_timeout: float = 30.0,
-        verbose_debug: bool = False,
+        verbose_debug: bool = True,
     ) -> None:
         self.provider = provider or SharedTensorProvider(execution_mode="server")
         self.socket_path = socket_path or resolve_runtime_socket_path(

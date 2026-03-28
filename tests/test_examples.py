@@ -7,6 +7,20 @@ import pytest
 from shared_tensor import SharedTensorProvider
 
 
+
+
+def test_shared_tensor_default_logger_honors_env_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+    import logging
+    import shared_tensor
+
+    monkeypatch.setenv("SHARED_TENSOR_LOG_LEVEL", "INFO")
+    shared_tensor = importlib.reload(shared_tensor)
+
+    logger = logging.getLogger("shared_tensor")
+    assert logger.level == logging.INFO
+    assert logger.handlers
+
 def test_examples_server_modules_expose_server_mode_providers() -> None:
     model_service = importlib.import_module("examples.model_service")
     basic_service = importlib.import_module("examples.basic_service")
