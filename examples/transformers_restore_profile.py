@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import multiprocessing as mp
+import os
 import pickle
 import time
 from pathlib import Path
@@ -12,9 +13,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import torch
+from huggingface_hub import snapshot_download
 from transformers import AutoModel
 
 from shared_tensor.utils import _torch_forking_pickler
+
+
+MODEL_ID = "bert-base-uncased"
 
 
 def _torch_serialize(obj):
@@ -78,13 +83,12 @@ def _producer(queue, model_path: str) -> None:
 
 
 def _resolve_model_path() -> Path:
-    root = Path(
-        "/home/niubility2/pretrained_models/huggingface/hub/models--bert-base-uncased"
+    return Path(
+        snapshot_download(
+            repo_id=MODEL_ID,
+            local_files_only=True,
+        )
     )
-    snapshots = root / "snapshots"
-    if snapshots.is_dir():
-        return sorted(path for path in snapshots.iterdir() if path.is_dir())[-1]
-    return root
 
 
 def main() -> None:

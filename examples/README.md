@@ -27,16 +27,16 @@ Without `SHARED_TENSOR_ENABLED=1`, providers stay in local mode by default.
 For the `transformers` demos:
 
 ```bash
-TRANSFORMERS_MODEL_ROOT=/path/to/models--bert-base-uncased \
+hf download bert-base-uncased
+
 SHARED_TENSOR_ENABLED=1 SHARED_TENSOR_ROLE=server \
 python examples/transformers_two_proc_demo.py
 
-TRANSFORMERS_MODEL_ROOT=/path/to/models--bert-base-uncased \
 SHARED_TENSOR_ENABLED=1 \
 python examples/transformers_two_proc_demo.py
 ```
 
-`TRANSFORMERS_MODEL_ROOT` may point either at a concrete model directory or a Hugging Face cache root containing `snapshots/`; the example resolves the newest snapshot automatically. `TRANSFORMERS_AUTO_CLASS` defaults to `AutoModel`.
+`examples/transformers_two_proc_demo.py` uses cached `bert-base-uncased` through Hugging Face's own cache resolution and loads it with `AutoModel`.
 
 For `transformers` specifically, a fresh client Python process may still spend noticeable time in module import and class resolution before the shared object is ready. That cold-process cost is outside the CUDA IPC reopen path itself; a second reopen inside the same client process should be much faster and should still avoid allocating a second full GPU copy.
 

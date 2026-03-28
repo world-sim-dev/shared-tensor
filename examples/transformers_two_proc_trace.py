@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pickle
+import os
 import sys
 import time
 from pathlib import Path
@@ -10,15 +11,21 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import torch
+from huggingface_hub import snapshot_download
 from transformers import AutoModel
 
 from shared_tensor import SharedTensorClient, SharedTensorProvider, SharedTensorServer
 import shared_tensor.utils as utils
 
 BASE_PATH = "/tmp/shared-tensor-trace"
-MODEL_ROOT = Path("/home/niubility2/pretrained_models/huggingface/hub/models--bert-base-uncased")
-SNAPSHOTS = MODEL_ROOT / "snapshots"
-MODEL_PATH = str(sorted([p for p in SNAPSHOTS.iterdir() if p.is_dir()])[-1] if SNAPSHOTS.is_dir() else MODEL_ROOT)
+MODEL_ID = "bert-base-uncased"
+
+
+def _resolve_model_path() -> str:
+    return snapshot_download(
+        repo_id=MODEL_ID,
+        local_files_only=True,
+    )
 
 
 def _patch_server() -> None:
@@ -67,8 +74,9 @@ def _patch_client() -> None:
 def run_server() -> int:
     _patch_server()
     provider = SharedTensorProvider(execution_mode="server", base_path=BASE_PATH, timeout=120.0)
+    model_path = _resolve_model_path()
     model = AutoModel.from_pretrained(
-        MODEL_PATH,
+        model_path,
         trust_remote_code=False,
         local_files_only=True,
         low_cpu_mem_usage=False,
@@ -84,16 +92,17 @@ def run_server() -> int:
     def load_model(model_path: str | None = None):
         return model
 
-    load_model(model_path=MODEL_PATH)
+    load_model(model_path=model_path)
     SharedTensorServer(provider).start(blocking=True)
     return 0
 
 
 def run_client() -> int:
     _patch_client()
+    model_path = _resolve_model_path()
     client = SharedTensorClient(base_path=BASE_PATH, timeout=120.0)
     started = time.perf_counter()
-    obj = client.call("load_model", model_path=MODEL_PATH)
+    obj = client.call("load_model", model_path=model_path)
     elapsed = time.perf_counter() - started
     print(
         {

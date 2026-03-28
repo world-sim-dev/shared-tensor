@@ -105,25 +105,22 @@ manages cache and refcounts         releases managed handles explicitly
 `shared_tensor` also supports CUDA `transformers.PreTrainedModel` instances.
 
 See:
-- `examples/transformers_two_proc_demo.py`: minimal same-code two-process demo using `AutoModel`-style loading
+- `examples/transformers_two_proc_demo.py`: minimal same-code two-process demo using `AutoModel`
 - `examples/transformers_mutation_check.py`: proves client-side in-place parameter mutation is visible on the server
 - `examples/transformers_ipc_benchmark.py`: measures reopen latency and client GPU memory delta
 
 Usage:
 
 ```bash
-TRANSFORMERS_MODEL_ROOT=/path/to/model-or-hf-cache/models--bert-base-uncased \
 SHARED_TENSOR_ENABLED=1 SHARED_TENSOR_ROLE=server \
 python examples/transformers_two_proc_demo.py
 
-TRANSFORMERS_MODEL_ROOT=/path/to/model-or-hf-cache/models--bert-base-uncased \
 SHARED_TENSOR_ENABLED=1 \
 python examples/transformers_two_proc_demo.py
 ```
 
 Notes:
-- `TRANSFORMERS_MODEL_ROOT` may point either to a resolved local model directory or to a Hugging Face cache root like `models--...`; the example resolves the newest snapshot automatically
-- `TRANSFORMERS_AUTO_CLASS` defaults to `AutoModel` and can be overridden to another `Auto*` class that exposes `from_pretrained`
+- the demo uses cached `bert-base-uncased` directly via Hugging Face's own cache resolution; prefetch it first with `hf download bert-base-uncased`
 - for custom `transformers` code paths, the library stages the required module source files before reopening the shared module on the client
 - transport remains same-host same-GPU torch CUDA IPC; the client should not allocate a second full model copy just to reconstruct parameters
 - in a fresh client Python process, the first reopen may still look slow because `transformers` import/module resolution is often much slower than the shared-tensor IPC restore path itself; a second reopen in the same process should be much faster

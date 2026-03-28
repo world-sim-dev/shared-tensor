@@ -14,22 +14,20 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import torch
+from huggingface_hub import snapshot_download
 from transformers import AutoModel
 
 from shared_tensor import SharedTensorClient, SharedTensorProvider, SharedTensorServer
 
-MODEL_ROOT = os.environ["TRANSFORMERS_MODEL_ROOT"]
-SNAPSHOTS = os.path.join(MODEL_ROOT, "snapshots")
-if os.path.isdir(SNAPSHOTS):
-    entries = sorted(
-        os.path.join(SNAPSHOTS, name)
-        for name in os.listdir(SNAPSHOTS)
-        if os.path.isdir(os.path.join(SNAPSHOTS, name))
-    )
-    MODEL_PATH = entries[-1]
-else:
-    MODEL_PATH = MODEL_ROOT
+MODEL_ID = "bert-base-uncased"
 BASE_PATH = "/tmp/shared-tensor-transformers-mutation"
+
+
+def _resolve_model_path() -> str:
+    return snapshot_download(
+        repo_id=MODEL_ID,
+        local_files_only=True,
+    )
 
 
 def first_param_stats(model):
@@ -45,8 +43,9 @@ def first_param_stats(model):
 def server_main(ready_q, command_q, result_q):
     os.environ["SHARED_TENSOR_ROLE"] = "server"
     provider = SharedTensorProvider(execution_mode="server", base_path=BASE_PATH, timeout=120.0)
+    model_path = _resolve_model_path()
     model = AutoModel.from_pretrained(
-        MODEL_PATH,
+        model_path,
         trust_remote_code=False,
         local_files_only=True,
         low_cpu_mem_usage=False,

@@ -7,6 +7,9 @@ import sys
 import time
 from pathlib import Path
 
+from huggingface_hub import snapshot_download
+from transformers import AutoModel
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -16,6 +19,7 @@ import torch
 from shared_tensor import SharedObjectHandle, SharedTensorProvider
 
 provider = SharedTensorProvider(timeout=float(os.getenv("SHARED_TENSOR_TIMEOUT", "600.0")))
+MODEL_ID = "bert-base-uncased"
 
 
 def _require_cuda() -> None:
@@ -23,25 +27,19 @@ def _require_cuda() -> None:
         raise RuntimeError("CUDA is required for this example")
 
 
-def _model_root() -> Path:
-    raw = os.getenv("TRANSFORMERS_MODEL_ROOT")
-    if not raw:
-        raise RuntimeError(
-            "Set TRANSFORMERS_MODEL_ROOT to a local Hugging Face model directory or models--... cache root"
-        )
-    return Path(raw).expanduser()
-
-
 def _resolve_model_path() -> Path:
-    root = _model_root()
-    snapshots_dir = root / "snapshots"
-    if snapshots_dir.is_dir():
-        snapshots = sorted(path for path in snapshots_dir.iterdir() if path.is_dir())
-        if snapshots:
-            return snapshots[-1]
-    if root.is_dir():
-        return root
-    raise FileNotFoundError(f"Transformers model directory not found: {root}")
+    try:
+        return Path(
+            snapshot_download(
+                repo_id=MODEL_ID,
+                local_files_only=True,
+            )
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not resolve cached Hugging Face model {MODEL_ID}. "
+            "Prefetch it with `hf download bert-base-uncased` or `transformers.from_pretrained` first"
+        ) from exc
 
 
 def _prepare_model_path(model_path: Path) -> Path:
@@ -52,22 +50,8 @@ def _prepare_model_path(model_path: Path) -> Path:
     return resolved_model_path
 
 
-def _resolve_auto_class() -> type:
-    import transformers
-
-    class_name = (os.getenv("TRANSFORMERS_AUTO_CLASS") or "AutoModel").strip() or "AutoModel"
-    try:
-        auto_class = getattr(transformers, class_name)
-    except AttributeError as exc:
-        raise RuntimeError(f"Unsupported transformers auto class: {class_name}") from exc
-    if not hasattr(auto_class, "from_pretrained"):
-        raise RuntimeError(f"{class_name} does not expose from_pretrained")
-    return auto_class
-
-
 def _load_model(model_path: Path):
-    auto_class = _resolve_auto_class()
-    model = auto_class.from_pretrained(
+    model = AutoModel.from_pretrained(
         model_path,
         trust_remote_code=False,
         local_files_only=True,
@@ -157,7 +141,7 @@ if __name__ == "__main__":
         "MODEL_READY",
         {
             "mode": provider.execution_mode,
-            "auto_class": _resolve_auto_class().__name__,
+            "auto_class": AutoModel.__name__,
             "model_path": str(resolved_model_path),
             "handle": handle is not None,
             "type": type(model).__name__,
