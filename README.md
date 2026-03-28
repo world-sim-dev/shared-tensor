@@ -25,9 +25,10 @@ Not supported:
 
 ## Install
 
-Use Python `3.9+` and a CUDA-enabled PyTorch build.
+Use Python `3.9+`. Install a compatible PyTorch build first, then install `shared-tensor`.
 
 ```bash
+pip install torch
 pip install shared-tensor
 ```
 
@@ -39,7 +40,7 @@ conda activate shared-tensor-dev
 pip install -e ".[dev,test]"
 ```
 
-If you want to share Hugging Face `transformers` models, install `transformers` in both the server and client environments as well.
+If you want to share Hugging Face `transformers` models, install both `torch` and `transformers` in the server and client environments. `shared-tensor` no longer installs `torch` for you.
 
 ## Docs
 
