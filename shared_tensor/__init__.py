@@ -4,18 +4,28 @@ import logging
 import os
 
 
+class _SafeStreamHandler(logging.StreamHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        stream = self.stream
+        if stream is None or getattr(stream, "closed", False):
+            return
+        try:
+            super().emit(record)
+        except ValueError:
+            return
+
+
 def _configure_default_logging() -> None:
     logger = logging.getLogger("shared_tensor")
     if logger.handlers:
         return
     level_name = os.getenv("SHARED_TENSOR_LOG_LEVEL", "INFO").strip().upper() or "INFO"
     level = getattr(logging, level_name, logging.INFO)
-    handler = logging.StreamHandler()
+    handler = _SafeStreamHandler()
     handler.setFormatter(logging.Formatter("[shared_tensor] %(levelname)s %(name)s: %(message)s"))
     logger.addHandler(handler)
     logger.setLevel(level)
     logger.propagate = False
-
 
 _configure_default_logging()
 

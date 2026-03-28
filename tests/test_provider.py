@@ -8,13 +8,36 @@ from shared_tensor.errors import (
     SharedTensorProviderError,
 )
 
-
-
-
 def test_provider_defaults_to_verbose_debug() -> None:
     provider = SharedTensorProvider(execution_mode="local")
 
     assert provider.verbose_debug is True
+
+def test_provider_auto_mode_environment_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SHARED_TENSOR_ENABLED", raising=False)
+    monkeypatch.delenv("SHARED_TENSOR_ROLE", raising=False)
+    provider = SharedTensorProvider()
+    assert provider.execution_mode == "local"
+    assert provider.auto_mode is True
+
+    monkeypatch.setenv("SHARED_TENSOR_ENABLED", "1")
+    monkeypatch.delenv("SHARED_TENSOR_ROLE", raising=False)
+    provider = SharedTensorProvider()
+    assert provider.execution_mode == "client"
+    assert provider.auto_mode is True
+
+    monkeypatch.setenv("SHARED_TENSOR_ROLE", "server")
+    provider = SharedTensorProvider()
+    assert provider.execution_mode == "server"
+    assert provider.auto_mode is True
+
+    monkeypatch.setenv("SHARED_TENSOR_ROLE", "client")
+    provider = SharedTensorProvider()
+    assert provider.execution_mode == "client"
+    assert provider.auto_mode is True
+
 
 def test_provider_registers_function_name_endpoints() -> None:
     provider = SharedTensorProvider(execution_mode="local")

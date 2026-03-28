@@ -355,7 +355,7 @@ info = provider.get_runtime_info()
 
 `shared_tensor` now installs a default package logger on import and enables detailed logs by default.
 
-- default level: `DEBUG`
+- default level: `INFO`
 - logger name: `shared_tensor`
 - override level with `SHARED_TENSOR_LOG_LEVEL`, for example `INFO`, `WARNING`, or `ERROR`
 - pass `verbose_debug=False` to `SharedTensorProvider`, `SharedTensorClient`, `AsyncSharedTensorClient`, or `SharedTensorServer` if you want to suppress detailed request-level logs
